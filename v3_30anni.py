@@ -219,6 +219,24 @@ def simula_scenario_30_anni(prod_pv, prod_wind, fabbisogno,
             pv_gw * 1000.0, wind_gw * 1000.0, nuc_gw * 1000.0, bess_gwh * 1000.0, 
             bess_mw, 50000.0, 2500.0, 12000.0, 5000000.0, 2850.0
         )
+        
+        # --- SEZIONE RICUCITA (PRIMA ERA ORFANATA) ---
+        gas_tot += gas
+        def_tot += dfc
+        over_tot += ovr
+        hydro_disp_tot += hyd
+        bess_out_tot += bss
+        bess_installed_tot_mwh_years += (bess_gwh * 1000.0)
+            
+        pv_gen_anno = np.sum(prod_pv * (pv_gw * 1000.0))
+        wind_gen_anno = np.sum(prod_wind * (wind_gw * 1000.0))
+        pv_gen_tot += pv_gen_anno
+        wind_gen_tot += wind_gen_anno
+        nuc_gen_tot += (nuc_gw * 1000.0 * 0.90 * ore_anno)
+        vre_gen_tot += (pv_gen_anno + wind_gen_anno)
+            
+    return (gas_tot, def_tot, over_tot, hydro_disp_tot, bess_out_tot, 
+            pv_gen_tot, wind_gen_tot, nuc_gen_tot, bess_installed_tot_mwh_years, vre_gen_tot)
 
 @njit
 def simula_rete_dettaglio_orario(produzione_pv, produzione_wind, fabbisogno,
@@ -290,23 +308,6 @@ def simula_rete_dettaglio_orario(produzione_pv, produzione_wind, fabbisogno,
                 out_deficit[t] = energia_richiesta - uso_gas
 
     return out_pv, out_wind, out_nuc, out_hydro_fluente, out_hydro_bacino, out_bess_scarica, out_gas, out_deficit
-        
-    gas_tot += gas
-    def_tot += dfc
-    over_tot += ovr
-    hydro_disp_tot += hyd
-    bess_out_tot += bss
-    bess_installed_tot_mwh_years += (bess_gwh * 1000.0)
-        
-    pv_gen_anno = np.sum(prod_pv * (pv_gw * 1000.0))
-    wind_gen_anno = np.sum(prod_wind * (wind_gw * 1000.0))
-    pv_gen_tot += pv_gen_anno
-    wind_gen_tot += wind_gen_anno
-    nuc_gen_tot += (nuc_gw * 1000.0 * 0.90 * ore_anno)
-    vre_gen_tot += (pv_gen_anno + wind_gen_anno)
-        
-    return (gas_tot, def_tot, over_tot, hydro_disp_tot, bess_out_tot, 
-            pv_gen_tot, wind_gen_tot, nuc_gen_tot, bess_installed_tot_mwh_years, vre_gen_tot)
 
 # ==========================================
 # 3. HELPER PYTHON E MOTORE SCENARI
@@ -614,7 +615,7 @@ try:
     fig2.update_yaxes(title_text="Gas Bruciato (TWh)", secondary_y=True, range=[0, max_gas])
     st.plotly_chart(fig2, use_container_width=True)
 
-# ==========================================
+    # ==========================================
     # GRAFICO ORARIO DELL'ULTIMO ANNO (ZOOMABILE)
     # ==========================================
     st.markdown("---")
