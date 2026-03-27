@@ -220,7 +220,7 @@ def simula_scenario_30_anni(prod_pv, prod_wind, fabbisogno,
             bess_mw, 50000.0, 2500.0, 12000.0, 5000000.0, 2850.0
         )
 
-        @njit
+@njit
 def simula_rete_dettaglio_orario(produzione_pv, produzione_wind, fabbisogno,
                                  pv_mw, wind_mw, nucleare_mw, bess_mwh, bess_mw, gas_mw,
                                  hydro_fluente_mw, hydro_bacino_mw, hydro_bacino_max_mwh, hydro_inflow_mw,
