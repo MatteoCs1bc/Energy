@@ -499,13 +499,8 @@ try:
         nuc_start = c4.number_input("Inizio Nucleare", 0, 40, 12, help="Richiede molti anni di permitting e costruzione.")
         nuc_end = c4.number_input("Fine Nucleare", 1, 50, 20)
 
-    # Identifica lo Status Quo (il minimo assoluto del simulatore per iniziare a contare da zero)
-    status_quo = df_plot.loc[
-        (df_plot['PV_GW'] == df_plot['PV_GW'].min()) & 
-        (df_plot['Wind_GW'] == df_plot['Wind_GW'].min()) & 
-        (df_plot['BESS_GWh'] == df_plot['BESS_GWh'].min()) & 
-        (df_plot['Nuc_GW'] == df_plot['Nuc_GW'].min())
-    ].iloc[0]
+    # Identifica lo Status Quo IN MODO SICURO ordinando la tabella
+    status_quo = df_plot.sort_values(by=['PV_GW', 'Wind_GW', 'BESS_GWh', 'Nuc_GW']).iloc[0]
 
     array_pv = df_completo['Fattore_Capacita_PV'].to_numpy(dtype=np.float64)
     array_wind = df_completo['Fattore_Capacita_Wind'].to_numpy(dtype=np.float64)
