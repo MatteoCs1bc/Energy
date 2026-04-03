@@ -635,28 +635,27 @@ try:
         
         # OPZIONE A: NUCLEARE DEDICATO (H2 Rosa)
         cf_nuc = 0.92
-        taglia_elc_nuc_gw = energia_el_input_h2_twh / (8760 * cf_nuc)
-        curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, taglia_elc_nuc_gw * 8760 * 0.1)
+        # FIX: * 1000 per passare da TW a GW
+        taglia_elc_nuc_gw = (energia_el_input_h2_twh * 1000) / (8760 * cf_nuc)
+        curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, (taglia_elc_nuc_gw / 1000) * 8760 * 0.1)
         energia_da_pagare_nuc_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_nuc_twh)
         
-        # FIX ARITMETICO: GW * €/kW = Milioni di €. TWh * €/MWh = Milioni di €.
         costo_energia_nuc_mln = energia_da_pagare_nuc_twh * mercato['cfd_nuc']
         capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * capex_elc
         
         # OPZIONE B: RINNOVABILI DEDICATE (H2 Verde)
         cf_vre = 0.30
-        taglia_elc_vre_gw = energia_el_input_h2_twh / (8760 * cf_vre)
-        curtailment_recuperato_vre_twh = min(overgen_disp_twh * 0.7, taglia_elc_vre_gw * 8760 * 0.5)
+        # FIX: * 1000 per passare da TW a GW
+        taglia_elc_vre_gw = (energia_el_input_h2_twh * 1000) / (8760 * cf_vre)
+        curtailment_recuperato_vre_twh = min(overgen_disp_twh * 0.7, (taglia_elc_vre_gw / 1000) * 8760 * 0.5)
         energia_da_pagare_vre_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_vre_twh)
         
         lcoe_vre_medio = (mercato['cfd_pv'] * 0.6) + (mercato['cfd_wind'] * 0.4) 
-        # FIX ARITMETICO
         costo_energia_vre_mln = energia_da_pagare_vre_twh * lcoe_vre_medio
         capex_tot_elc_vre_mln = taglia_elc_vre_gw * capex_elc
 
         # STEP 4: STOCCAGGIO E COMPRESSIONE 
         capacita_stoccaggio_kton = h2_necessario_kton * 0.30 
-        # FIX ARITMETICO: kton * €/kg = Milioni di €.
         capex_stoccaggio_mln = capacita_stoccaggio_kton * capex_salt_cavern
         costo_compressione_mln = (h2_necessario_kton * 1e6) * lavoro_compressore_kwh_kg * (mercato['cfd_pv']/1000) / 1e6 
 
