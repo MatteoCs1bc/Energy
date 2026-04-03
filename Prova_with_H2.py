@@ -833,10 +833,13 @@ try:
                 miglior_config['Nuc_GW'] * 1000.0, miglior_config['BESS_GWh'] * 1000.0,
                 50000.0, 2500.0, 5000000.0, 2850.0
             )
+            
+            # FIX: Calcoliamo dinamicamente le ore dell'anno (8760 o 8784)
+            ore_totali = len(overgen_orario)
 
             # Recupero Nucleare
             # Capacità residua oraria = Nominale - Usata (il Nuke usa una frazione piatta fissa)
-            elc_usage_nuc_mw = np.full(8760, taglia_elc_nuc_gw * 1000 * cf_nuc)
+            elc_usage_nuc_mw = np.full(ore_totali, taglia_elc_nuc_gw * 1000 * cf_nuc)
             unused_nuc_mw = (taglia_elc_nuc_gw * 1000) - elc_usage_nuc_mw
             recupero_nuc_mwh = np.sum(np.minimum(unused_nuc_mw, overgen_orario))
             
