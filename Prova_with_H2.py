@@ -159,7 +159,7 @@ def carica_dati_v2(file_fotovoltaico, file_gme, file_eolico, quota_pv_nord, quot
 
 
 # ==========================================
-# 2. SIMULAZIONE FISICA (Numba) - Rete Principale
+# 2. SIMULAZIONE FISICA (Numba) - Rete
 # ==========================================
 @njit
 def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
@@ -231,13 +231,12 @@ def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
 
 
 # ==========================================
-# MODULO H2: ESTRAZIONE E OTTIMIZZAZIONE
+# NUOVO MOTORE H2: CO-OTTIMIZZAZIONE ORARIA (Numba)
 # ==========================================
 @njit
 def estrai_curva_overgen_oraria(produzione_pv, produzione_wind, fabbisogno,
                                 pv_mw, wind_mw, nucleare_mw, bess_mwh, bess_mw,
                                 hydro_fluente_mw, hydro_bacino_max_mwh, hydro_inflow_mw, efficienza_bess=0.9):
-    # Ripete la simulazione di rete per estrarre la curva esatta di energia sversata (curtailment)
     ore = len(fabbisogno)
     soc_corrente = bess_mwh * 0.5
     soc_hydro = hydro_bacino_max_mwh * 0.5
@@ -285,105 +284,160 @@ def estrai_curva_overgen_oraria(produzione_pv, produzione_wind, fabbisogno,
 
 
 @njit
-def eff_elc(x):
-    # La tua formula polinomiale per l'efficienza ai carichi parziali
-    y = -6.1371 * x**6 + 24.394 * x**5 - 39.663 * x**4 + 33.988 * x**3 - 16.412 * x**2 + 4.2929 * x + 0.1022
-    if y > 0.8: return 0.8
-    if y < 0.0: return 0.0
-    return y
+def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW, target_mwh_el,
+                                capex_elc_mw, capex_batt_mwh, costo_annuo_vre_gw, crf):
+    """
+    Trova la combinazione ottimale di (Elettrolizzatore, Rinnovabile Dedicata, Batterie Dedicate)
+    SIMULTANEAMENTE al recupero del curtailment di rete.
+    """
+    miglior_costo = 1e15
+    best_elc_gw = 0.0
+    best_vre_gw = 0.0
+    best_batt_gwh = 0.0
+    best_recupero_mwh = 0.0
+    
+    # Costruiamo una griglia di ricerca dinamica (per evitare loop infiniti)
+    # Se servono 10 TWh, base_elc = ~1.1 GW. Cerchiamo fino a 6x.
+    elc_base = target_mwh_el / 8760.0
+    ore_eq_vre = np.sum(vre_profile_1GW)
+    vre_base = target_mwh_el / ore_eq_vre if ore_eq_vre > 0 else 10.0
+    
+    elc_steps = np.linspace(elc_base * 0.5, elc_base * 6.0, 20)
+    vre_steps = np.linspace(0.0, vre_base * 2.0, 20)
+    batt_steps = np.linspace(0.0, vre_base * 4.0, 15)
+    
+    ore_tot = len(overgen_array)
+    
+    for vre_gw in vre_steps:
+        costo_vre = vre_gw * costo_annuo_vre_gw
+        for elc_gw in elc_steps:
+            costo_elc = elc_gw * 1000.0 * capex_elc_mw * crf
+            for batt_gwh in batt_steps:
+                costo_batt = batt_gwh * 1000.0 * capex_batt_mwh * crf
+                
+                costo_tot = costo_vre + costo_elc + costo_batt
+                # Pruning: se l'impianto costa già più del "miglior costo" trovato finora, non serve simularlo!
+                if costo_tot >= miglior_costo:
+                    continue
+                    
+                # Simula le 8760 ore con questa specifica configurazione
+                soc = 0.0
+                batt_mw = batt_gwh * 1000.0
+                elc_mw = elc_gw * 1000.0
+                eff = 0.95
+                energia_assorbita = 0.0
+                recupero_grid = 0.0
+                
+                for t in range(ore_tot):
+                    p_vre = vre_profile_1GW[t] * vre_gw
+                    p_grid = overgen_array[t]
+                    
+                    # Disponibilità immediata
+                    p_avail = p_vre + p_grid
+                    
+                    # Scarica della batteria se l'energia diretta non basta a saturare l'elettrolizzatore
+                    p_discharge = 0.0
+                    if p_avail < elc_mw and soc > 0:
+                        p_discharge = min(soc * eff, batt_mw, elc_mw - p_avail)
+                        
+                    p_tot = p_avail + p_discharge
+                    
+                    # Cut-off Elettrolizzatore (15%)
+                    if p_tot >= elc_mw * 0.15:
+                        p_elc = min(p_tot, elc_mw)
+                        energia_assorbita += p_elc
+                        
+                        # Calcolo attribuzione: quanta energia proviene dalla rete?
+                        if p_vre >= p_elc:
+                            usato_grid = 0.0
+                            p_excess = p_vre - p_elc + p_grid
+                        else:
+                            if p_vre + p_grid >= p_elc:
+                                usato_grid = p_elc - p_vre
+                                p_excess = p_grid - usato_grid
+                            else:
+                                usato_grid = p_grid
+                                p_excess = 0.0
+                                
+                        recupero_grid += usato_grid
+                        soc -= (p_discharge / eff)
+                        
+                        # Carica la batteria con l'eccesso totale
+                        if p_excess > 0 and soc < batt_gwh * 1000.0:
+                            charge = min(p_excess, batt_mw, (batt_gwh * 1000.0 - soc)/eff)
+                            soc += charge * eff
+                    else:
+                        # Elettrolizzatore spento. Tutta l'energia va in batteria.
+                        if p_avail > 0 and soc < batt_gwh * 1000.0:
+                            charge = min(p_avail, batt_mw, (batt_gwh * 1000.0 - soc)/eff)
+                            soc += charge * eff
+                            
+                # Fine dell'anno. Ha raggiunto il target?
+                if energia_assorbita >= target_mwh_el:
+                    if costo_tot < miglior_costo:
+                        miglior_costo = costo_tot
+                        best_elc_gw = elc_gw
+                        best_vre_gw = vre_gw
+                        best_batt_gwh = batt_gwh
+                        best_recupero_mwh = recupero_grid
+                        
+    # Fallback d'emergenza se la griglia non trova nulla
+    if best_elc_gw == 0.0:
+        best_elc_gw = elc_base * 3.5
+        best_vre_gw = vre_base * 1.5
+        best_batt_gwh = 0.0
+        best_recupero_mwh = 0.0
+        
+    return float(best_elc_gw), float(best_vre_gw), float(best_batt_gwh), float(best_recupero_mwh)
 
 
 @njit
-def simula_impianto_h2_dedicato(vre_mw_array, elc_mw, batt_mwh, min_elc_fraction=0.15, eff_batt=0.95):
-    # Simula un impianto dedicato: Rinnovabili + Batterie + Elettrolizzatore
-    ore = len(vre_mw_array)
-    soc = 0.0
-    batt_mw = batt_mwh # Assumiamo C-rate 1
-    eff_chg = np.sqrt(eff_batt)
-    eff_dis = np.sqrt(eff_batt)
+def ottimizza_h2_nucleare(overgen_array, target_mwh_el, capex_elc_mw, cfd_nuc, cf_nuc, crf):
+    miglior_costo = 1e15
+    best_elc_gw = 0.0
+    best_recupero_mwh = 0.0
     
-    h2_kg_tot = 0.0
-    elc_usage_mw = np.zeros(ore)
-    min_elc = elc_mw * min_elc_fraction
+    elc_base = target_mwh_el / 8760.0
+    ore_tot = len(overgen_array)
     
-    for t in range(ore):
-        p_vre = vre_mw_array[t]
-        max_discharge = min(soc * eff_dis, batt_mw)
-        max_charge = min((batt_mwh - soc) / eff_chg, batt_mw)
+    for elc_gw in np.linspace(elc_base * 0.5, elc_base * 5.0, 50):
+        costo_elc = elc_gw * 1000.0 * capex_elc_mw * crf
+        elc_mw = elc_gw * 1000.0
         
-        tot_avail = p_vre + max_discharge
+        energia_assorbita = 0.0
+        recupero_grid = 0.0
+        p_nuc_piatto = elc_mw * cf_nuc
         
-        if tot_avail < min_elc:
-            # L'elettrolizzatore si spegne. L'energia VRE va in batteria se c'è spazio.
-            p_elc = 0.0
-            charge = min(p_vre, max_charge)
-            soc += charge * eff_chg
-        else:
-            # L'elettrolizzatore lavora
-            p_elc = min(tot_avail, elc_mw)
+        for t in range(ore_tot):
+            p_grid = overgen_array[t]
+            p_avail = p_nuc_piatto + p_grid
             
-            if p_elc <= p_vre:
-                # Esubero VRE va in batteria
-                excess = p_vre - p_elc
-                charge = min(excess, max_charge)
-                soc += charge * eff_chg
+            p_elc = min(p_avail, elc_mw)
+            energia_assorbita += p_elc
+            
+            if p_nuc_piatto >= p_elc:
+                usato_grid = 0.0
             else:
-                # La batteria copre il gap
-                shortfall = p_elc - p_vre
-                discharge = shortfall / eff_dis
-                soc -= discharge
+                usato_grid = p_elc - p_nuc_piatto
                 
-        elc_usage_mw[t] = p_elc
+            recupero_grid += usato_grid
+            
+        if energia_assorbita >= target_mwh_el:
+            costo_tot = costo_elc + ((energia_assorbita - recupero_grid) * cfd_nuc)
+            if costo_tot < miglior_costo:
+                miglior_costo = costo_tot
+                best_elc_gw = elc_gw
+                best_recupero_mwh = recupero_grid
+                
+    if best_elc_gw == 0.0:
+        best_elc_gw = elc_base / cf_nuc
+        best_recupero_mwh = 0.0
         
-        if p_elc > 0:
-            var = p_elc / elc_mw
-            eta = eff_elc(var)
-            # m_H2 = e_H2 * eta / (120 / 3.6). Se p_elc è MW, kw = MW * 1000
-            kg_h2 = (p_elc * 1000.0) * eta / 33.333
-            h2_kg_tot += kg_h2
-            
-    return h2_kg_tot, elc_usage_mw
-
-
-@njit
-def ottimizza_dimensionamento_h2_rinnovabile(vre_mw_array_1GW, target_h2_kg, capex_elc_kw, capex_batt_kwh, cfd_vre_mwh, crf):
-    # FASE 2: Ottimizzazione Impianto Dedicato Indipendente
-    # Cerchiamo il set (Elettrolizzatore, Batteria) che minimizza il costo di H2 per 1 GW di VRE base.
-    
-    miglior_lcoh = 1e15
-    miglior_elc_mw = 0.0
-    miglior_batt_mwh = 0.0
-    miglior_h2_kg_prodotto = 0.0
-    
-    # Spazzoliamo le taglie (per 1000 MW di Rinnovabile dedicata)
-    for elc_mw in range(200, 1501, 100):      # Elettrolizzatore da 200 a 1500 MW
-        for batt_mwh in range(0, 4001, 500):  # Batterie da 0 a 4000 MWh
-            
-            h2_kg_tot, _ = simula_impianto_h2_dedicato(vre_mw_array_1GW, elc_mw, batt_mwh)
-            
-            if h2_kg_tot == 0:
-                continue
-                
-            # Costo Annuo dell'impianto isolato
-            vre_mwh_tot = np.sum(vre_mw_array_1GW)
-            costo_vre = vre_mwh_tot * cfd_vre_mwh
-            costo_elc = elc_mw * 1000 * capex_elc_kw * crf
-            costo_batt = batt_mwh * 1000 * capex_batt_kwh * crf
-            
-            costo_tot = costo_vre + costo_elc + costo_batt
-            lcoh = costo_tot / h2_kg_tot
-            
-            if lcoh < miglior_lcoh:
-                miglior_lcoh = lcoh
-                miglior_elc_mw = elc_mw
-                miglior_batt_mwh = batt_mwh
-                miglior_h2_kg_prodotto = h2_kg_tot
-                
-    return float(miglior_elc_mw), float(miglior_batt_mwh), float(miglior_h2_kg_prodotto)
+    return float(best_elc_gw), float(best_recupero_mwh)
 
 
 # ==========================================
-# 3. MOTORE DI CALCOLO SEPARATO
+# 3. MOTORE DI CALCOLO SEPARATO (RETE MAIN)
 # ==========================================
 @st.cache_data
 def simula_tutti_scenari_fisici(array_pv, array_wind, array_fabbisogno):
@@ -511,7 +565,7 @@ def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
 
 
 # ==========================================
-# 4. INTERFACCIA UTENTE (STREAMLIT) E MODULI
+# 4. INTERFACCIA UTENTE (STREAMLIT)
 # ==========================================
 try:
     st.title("⚡ Ottimizzatore Mix Energetico e Decarbonizzazione (BETA)")
@@ -752,11 +806,11 @@ try:
 
 
     # ==========================================
-    # 6. MODULO POWER-TO-GAS (OTTIMIZZAZIONE REALE E RECUPERO CURTAILMENT)
+    # 6. MODULO POWER-TO-GAS (CO-OTTIMIZZAZIONE ORARIA VRE+ELC+BATT+GRID)
     # ==========================================
     st.markdown("---")
-    st.header("🏭 L'Ultimo Miglio: Power-to-Gas con Batterie Dedicate e Recupero Spread")
-    st.markdown("1) Il sistema calcola il mix ottimale (Rinnovabile + Elettrolizzatore + **Batteria**) isolato, basandosi sulle curve orarie, per produrre il gas mancante.\n2) **Solo dopo**, interseca le ore in cui l'elettrolizzatore è parzialmente scarico con l'energia sprecata dalla rete nazionale, riducendo l'OPEX.")
+    st.header("🏭 L'Ultimo Miglio: Power-to-Gas con Co-Ottimizzazione di Rete")
+    st.markdown("Il motore Numba simula **6.000 combinazioni** di impianti (Pannelli + Elettrolizzatori + Batterie) per 8760 ore, incrociandole con la curva di scarto della rete. Troverà la combinazione che **minimizza il costo totale (LCOH)** sfruttando l'energia gratuita estiva della rete per abbassare il CAPEX dell'impianto verde.")
 
     hc1, hc2, hc3, hc4 = st.columns(4)
     eff_meth = hc1.slider("Efficienza Metanazione (H₂ -> CH₄) [%]", 70.0, 90.0, 78.0, step=1.0) / 100
@@ -764,98 +818,68 @@ try:
     capex_elc = hc3.slider("CAPEX Elettrolizzatore [€/kW]", 500, 2000, 1000, step=100)
     capex_meth = hc4.slider("CAPEX Metanatore [€/kW]", 200, 1000, 480, step=10)
 
-    # FASE 1: TARGET 
     gas_da_sostituire_twh = miglior_config['gas_mwh'] / 1e6
     energia_el_necessaria_h2_twh = gas_da_sostituire_twh / eff_meth
-    
-    # 1 MWh di metano = 0.198 tonnellate di CO2 biogenica necessarie
     co2_necessaria_kton = (gas_da_sostituire_twh * 1e6) * 0.198 / 1000
     costo_fornitura_co2_mln = (co2_necessaria_kton * 1000 * costo_co2) / 1e6 
-    
-    # 1 kg di H2 = 33.333 kWh
-    target_h2_kg = (energia_el_necessaria_h2_twh * 1e9) / 33.333
 
     if gas_da_sostituire_twh <= 0.1:
         st.success("🎉 Complimenti! La configurazione scelta non usa quasi più gas. Non serve un piano Power-to-Gas massivo.")
     else:
-        st.info(f"🎯 **Target:** Per produrre {gas_da_sostituire_twh:.1f} TWh di Metano Sintetico servono **{target_h2_kg/1e6:.1f} kton di Idrogeno** e **{co2_necessaria_kton:.1f} kton di CO₂ biogenica**.")
+        st.info(f"🎯 **Target:** Per produrre {gas_da_sostituire_twh:.1f} TWh di Metano Sintetico servono **{energia_el_necessaria_h2_twh:.1f} TWh di Idrogeno elettrico** e **{co2_necessaria_kton:.1f} kton di CO₂ biogenica**.")
 
-        with st.spinner("Ottimizzazione Impianti H2 (con Batterie) e calcolo recupero curtailment..."):
+        with st.spinner("Analisi di 70 milioni di scenari orari (Numba in esecuzione)..."):
             
-            wacc = mercato['wacc_bess']
-            vita_impianti = 20
-            crf = (wacc * (1 + wacc)**vita_impianti) / ((1 + wacc)**vita_impianti - 1) if wacc > 0 else 1/vita_impianti
-
-            # OPZIONE A: NUCLEARE (Baseload)
-            # L'elettrolizzatore viene dimensionato per lavorare al 92%.
-            cf_nuc = 0.92
-            eta_elc_media = 0.65
-            taglia_elc_nuc_gw = (energia_el_necessaria_h2_twh * 1000) / (8760 * cf_nuc * eta_elc_media)
-            costo_energia_nuc_mln = (energia_el_necessaria_h2_twh * 1e6 * mercato['cfd_nuc']) / 1e6
-            capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * capex_elc
-
-            # OPZIONE B: RINNOVABILI DEDICATE + BATTERIE (Simulazione Oraria)
-            # Creiamo un profilo VRE "Base" da 1 GW (basato sul mix di rete, es. 60% PV, 40% Eolico)
-            quota_pv = miglior_config['PV_GW'] / (miglior_config['PV_GW'] + miglior_config['Wind_GW'] + 1e-9)
-            vre_profile_1GW = (array_pv * quota_pv + array_wind * (1 - quota_pv)) * 1000.0 # MW
-            
-            lcoe_vre_medio = (mercato['cfd_pv'] * quota_pv) + (mercato['cfd_wind'] * (1 - quota_pv))
-            capex_batt_mwh = mercato['bess_capex']
-
-            # Ottimizzatore isolato per trovare il setup VRE più economico
-            opt_elc_mw, opt_batt_mwh, yield_h2_kg = ottimizza_dimensionamento_h2_rinnovabile(
-                vre_profile_1GW, target_h2_kg, capex_elc, capex_batt_mwh, lcoe_vre_medio, crf
-            )
-            
-            # Fattore di scala per raggiungere il target nazionale
-            scala = target_h2_kg / yield_h2_kg
-            taglia_vre_gw = 1.0 * scala
-            taglia_elc_vre_gw = (opt_elc_mw / 1000) * scala
-            taglia_batt_vre_gwh = (opt_batt_mwh / 1000) * scala
-            
-            # Ricalcoliamo esattamente il consumo orario di questo mega-impianto scalato
-            vre_profile_reale_mw = vre_profile_1GW * scala
-            _, elc_usage_vre_mw = simula_impianto_h2_dedicato(
-                vre_profile_reale_mw, opt_elc_mw * scala, opt_batt_mwh * scala
-            )
-            
-            # Calcolo costi impianto Rinnovabile Isolato
-            vre_mwh_tot_annuo = np.sum(vre_profile_reale_mw)
-            costo_energia_vre_mln = (vre_mwh_tot_annuo * lcoe_vre_medio) / 1e6
-            capex_tot_elc_vre_mln = taglia_elc_vre_gw * capex_elc
-            capex_batt_vre_mln = taglia_batt_vre_gwh * 1000 * capex_batt_mwh / 1e6
-
-            # FASE 3: IL RECUPERO DEL CURTAILMENT
-            # Estraiamo la curva di scarto della rete nazionale
+            # Estraiamo la curva oraria del curtailment di rete (la vera e propria disponibilità oraria)
             overgen_orario = estrai_curva_overgen_oraria(
                 array_pv, array_wind, array_fabbisogno,
                 miglior_config['PV_GW'] * 1000.0, miglior_config['Wind_GW'] * 1000.0,
                 miglior_config['Nuc_GW'] * 1000.0, miglior_config['BESS_GWh'] * 1000.0,
                 50000.0, 2500.0, 5000000.0, 2850.0
             )
-            
-            # FIX: Calcoliamo dinamicamente le ore dell'anno (8760 o 8784)
-            ore_totali = len(overgen_orario)
 
-            # Recupero Nucleare
-            # Capacità residua oraria = Nominale - Usata (il Nuke usa una frazione piatta fissa)
-            elc_usage_nuc_mw = np.full(ore_totali, taglia_elc_nuc_gw * 1000 * cf_nuc)
-            unused_nuc_mw = (taglia_elc_nuc_gw * 1000) - elc_usage_nuc_mw
-            recupero_nuc_mwh = np.sum(np.minimum(unused_nuc_mw, overgen_orario))
+            wacc = mercato['wacc_bess']
+            vita_impianti = 20
+            crf = (wacc * (1 + wacc)**vita_impianti) / ((1 + wacc)**vita_impianti - 1) if wacc > 0 else 1/vita_impianti
             
-            # Il recupero abbatte la bolletta che paghiamo al reattore nucleare
-            risparmio_nuc_mln = (recupero_nuc_mwh * mercato['cfd_nuc']) / 1e6
-            costo_energia_nuc_mln = max(0, costo_energia_nuc_mln - risparmio_nuc_mln)
+            h2_target_mwh_el = energia_el_necessaria_h2_twh * 1e6
 
-            # Recupero Rinnovabili
-            unused_vre_mw = (taglia_elc_vre_gw * 1000) - elc_usage_vre_mw
-            recupero_vre_mwh = np.sum(np.minimum(unused_vre_mw, overgen_orario))
+            # === OPZIONE 1: VIA NUCLEARE ===
+            # Ottimizza solo la taglia dell'elettrolizzatore, alimentato dal Reattore + Rete.
+            cf_nuc_impianto = 0.92
+            taglia_elc_nuc_gw, free_nuc_mwh = ottimizza_h2_nucleare(
+                overgen_orario, h2_target_mwh_el, capex_elc, mercato['cfd_nuc'], cf_nuc_impianto, crf
+            )
             
-            # L'energia assorbita a scrocco ci permette di "vendere" o risparmiare energia dai nostri pannelli VRE dedicati
-            risparmio_vre_mln = (recupero_vre_mwh * lcoe_vre_medio) / 1e6
-            costo_energia_vre_mln = max(0, costo_energia_vre_mln - risparmio_vre_mln)
+            energia_acquistata_nuc_mwh = h2_target_mwh_el - free_nuc_mwh
+            costo_energia_nuc_mln = (energia_acquistata_nuc_mwh * mercato['cfd_nuc']) / 1e6
+            capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * capex_elc
+            curtailment_recuperato_nuc_twh = free_nuc_mwh / 1e6
 
-        # COSTI METANATORE E BUFFER CO2 (Comuni)
+
+            # === OPZIONE 2: VIA RINNOVABILE (CO-OTTIMIZZAZIONE A 3 VARIABILI) ===
+            # Costruiamo il profilo della rinnovabile dedicata (mix 60% FV, 40% Wind) scalato a 1 GW
+            quota_pv = miglior_config['PV_GW'] / (miglior_config['PV_GW'] + miglior_config['Wind_GW'] + 1e-9)
+            vre_profile_1GW = (array_pv * quota_pv + array_wind * (1 - quota_pv)) * 1000.0 # MW
+            
+            # Calcoliamo il costo annualizzato di 1 GW di rinnovabili
+            ore_eq_vre_1gw = np.sum(vre_profile_1GW)
+            lcoe_vre_medio = (mercato['cfd_pv'] * quota_pv) + (mercato['cfd_wind'] * (1 - quota_pv))
+            costo_annuo_vre_gw = (ore_eq_vre_1gw * lcoe_vre_medio)
+            
+            # 🚀 L'algoritmo Numba esplora lo spazio 3D alla ricerca del set perfetto
+            taglia_elc_vre_gw, taglia_vre_gw, taglia_batt_gwh, free_vre_mwh = co_ottimizza_h2_rinnovabile(
+                overgen_orario, vre_profile_1GW, h2_target_mwh_el,
+                capex_elc, mercato['bess_capex'], costo_annuo_vre_gw, crf
+            )
+            
+            # Ricalcoliamo le finanze della configurazione vincente
+            costo_energia_vre_mln = (taglia_vre_gw * costo_annuo_vre_gw) / 1e6
+            capex_tot_elc_vre_mln = taglia_elc_vre_gw * capex_elc
+            capex_tot_batt_vre_mln = taglia_batt_gwh * 1000 * mercato['bess_capex'] * crf / 1e6
+            curtailment_recuperato_vre_twh = free_vre_mwh / 1e6
+
+        # COSTI METANATORE E BUFFER CO2 (Comuni per le due vie)
         taglia_meth_gw = (gas_da_sostituire_twh * 1000) / (8760 * 0.90)
         capex_tot_meth_mln = taglia_meth_gw * capex_meth
         opex_fix_meth_mln = capex_tot_meth_mln * 0.035
@@ -867,7 +891,7 @@ try:
 
         # CALCOLO LCO_CH4 FINALE
         costo_annuo_nuc_mln = (capex_tot_elc_nuc_mln * crf) + costo_energia_nuc_mln + costi_meth_comuni_mln_anno
-        costo_annuo_vre_mln = (capex_tot_elc_vre_mln * crf) + costo_energia_vre_mln + (capex_batt_vre_mln * crf) + costi_meth_comuni_mln_anno
+        costo_annuo_vre_mln = (capex_tot_elc_vre_mln * crf) + capex_tot_batt_vre_mln + costo_energia_vre_mln + costi_meth_comuni_mln_anno
         
         lco_ch4_nuc = (costo_annuo_nuc_mln * 1e6) / (gas_da_sostituire_twh * 1e6)
         lco_ch4_vre = (costo_annuo_vre_mln * 1e6) / (gas_da_sostituire_twh * 1e6)
@@ -877,35 +901,35 @@ try:
         with col_res1:
             st.markdown("### ⚛️ Via Nucleare (e-CH₄ Rosa)")
             st.markdown(f"- **Taglia Elettrolizzatore:** {taglia_elc_nuc_gw:.1f} GW")
-            st.markdown(f"- **Spreco di Rete Recuperato:** {recupero_nuc_mwh/1e6:.1f} TWh")
+            st.markdown(f"- **Spreco di Rete Recuperato:** {curtailment_recuperato_nuc_twh:.1f} TWh")
             
             diff_nuc = lco_ch4_nuc - mercato['gas_eur_mwh']
             st.metric("Costo Gas Sintetico (LCO_CH₄)", f"{lco_ch4_nuc:.1f} €/MWh", delta=f"{diff_nuc:+.1f} €/MWh vs Gas Fossile", delta_color="inverse")
             
         with col_res2:
             st.markdown("### 🌬️☀️ Via Rinnovabili (e-CH₄ Verde)")
-            st.markdown(f"- **Impianto Dedicato:** {taglia_vre_gw:.1f} GW Rinnovabili + {taglia_elc_vre_gw:.1f} GW Elettrolizzatore + {taglia_batt_vre_gwh:.1f} GWh Batterie")
-            st.markdown(f"- **Spreco di Rete Recuperato:** {recupero_vre_mwh/1e6:.1f} TWh")
+            st.markdown(f"- **Impianto Co-Ottimizzato:** {taglia_vre_gw:.1f} GW Rinnovabili + {taglia_elc_vre_gw:.1f} GW Elettrolizzatore + {taglia_batt_gwh:.1f} GWh Batterie")
+            st.markdown(f"- **Spreco di Rete Recuperato:** {curtailment_recuperato_vre_twh:.1f} TWh")
             
             diff_vre = lco_ch4_vre - mercato['gas_eur_mwh']
             st.metric("Costo Gas Sintetico (LCO_CH₄)", f"{lco_ch4_vre:.1f} €/MWh", delta=f"{diff_vre:+.1f} €/MWh vs Gas Fossile", delta_color="inverse")
 
         df_ptg_costi = pd.DataFrame({
-            'Voce': ['CAPEX Elettrolizzatore', 'CAPEX Batterie Dedicate', 'Acquisto Energia / VRE Dedicato', 'CAPEX Metanatore + CO2', 'OPEX Metanatore + Fornitura CO2'],
+            'Voce': ['CAPEX Elettrolizzatore', 'CAPEX Batterie Dedicate', 'Energia (Rinnovabile Dedicata o Rete)', 'CAPEX Metanatore + CO2', 'OPEX Metanatore + Fornitura CO2'],
             'Nucleare (Milioni €/anno)': [capex_tot_elc_nuc_mln * crf, 0, costo_energia_nuc_mln, (capex_tot_meth_mln + capex_co2_storage_mln) * crf, opex_fix_meth_mln + opex_var_meth_mln + costo_fornitura_co2_mln],
-            'Rinnovabili (Milioni €/anno)': [capex_tot_elc_vre_mln * crf, capex_batt_vre_mln * crf, costo_energia_vre_mln, (capex_tot_meth_mln + capex_co2_storage_mln) * crf, opex_fix_meth_mln + opex_var_meth_mln + costo_fornitura_co2_mln]
+            'Rinnovabili (Milioni €/anno)': [capex_tot_elc_vre_mln * crf, capex_tot_batt_vre_mln, costo_energia_vre_mln, (capex_tot_meth_mln + capex_co2_storage_mln) * crf, opex_fix_meth_mln + opex_var_meth_mln + costo_fornitura_co2_mln]
         })
         df_ptg_melted = df_ptg_costi.melt(id_vars='Voce', var_name='Scenario', value_name='Milioni €/anno')
         
         fig_ptg = px.bar(df_ptg_melted, x='Scenario', y='Milioni €/anno', color='Voce', barmode='stack',
-                        title="Scomposizione del Costo LCO_CH₄ (Ottimizzazione con Batterie Dedicate + Spread)",
+                        title="Scomposizione Costi LCO_CH₄ (Impianto Dedicato + Parassitismo di Rete)",
                         color_discrete_sequence=px.colors.qualitative.Pastel)
         st.plotly_chart(fig_ptg, use_container_width=True)
 
         costo_minimo_ptg_mln = min(costo_annuo_nuc_mln, costo_annuo_vre_mln)
         impatto_reale_sistema = (costo_minimo_ptg_mln * 1e6) / df_completo['Fabbisogno_MW'].sum()
         
-        st.error(f"⚡ **Impatto Definitivo sul Sistema:** Produrre il gas sintetico costerà circa **{costo_minimo_ptg_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale calcolata sopra.")
+        st.error(f"⚡ **Impatto Definitivo sul Sistema:** Produrre il metano sintetico verde/rosa costerà circa **{costo_minimo_ptg_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale calcolata sopra.")
 
 # ==========================================
 # GESTIONE ERRORI
