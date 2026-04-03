@@ -341,7 +341,7 @@ def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
             'Gas_%': percentuale_gas,
             'LCOS_BESS': lcos,
             'Overgen_TWh': r['overgen_mwh'] / 1e6,
-            'gas_mwh': r['gas_mwh']  # <--- ESSENZIALE PER IL MODULO H2
+            'gas_mwh': r['gas_mwh']
         })
 
     df_risultati = pd.DataFrame(storia)
@@ -361,7 +361,7 @@ def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
 
 
 # ==========================================
-# 4. INTERFACCIA UTENTE (STREAMLIT) & MODULI
+# 4. INTERFACCIA UTENTE (STREAMLIT) E MODULI
 # ==========================================
 try:
     st.title("⚡ Ottimizzatore Mix Energetico e Decarbonizzazione (BETA)")
@@ -623,7 +623,6 @@ try:
     # 0.198 tonnellate di CO2 per ogni MWh termico di CH4
     co2_necessaria_kton = (gas_da_sostituire_twh * 1e6) * 0.198 / 1000
     
-    # FIX ARITMETICO: kton * 1000 = tonnellate. tonnellate * €/ton = Euro. Euro / 1.000.000 = Milioni di Euro.
     costo_fornitura_co2_mln = (co2_necessaria_kton * 1000 * costo_co2) / 1e6 
 
     if gas_da_sostituire_twh <= 0.1:
@@ -714,3 +713,15 @@ try:
         impatto_reale_sistema = (costo_minimo_ptg_mln * 1e6) / df_completo['Fabbisogno_MW'].sum()
         
         st.error(f"⚡ **Impatto Definitivo sul Sistema:** Produrre in casa il metano sintetico per spegnere l'ultimo miglio fossile costerà **{costo_minimo_ptg_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale calcolata in alto.")
+
+# ==========================================
+# GESTIONE ERRORI
+# ==========================================
+except FileNotFoundError:
+    st.error("⚠️ File dati non trovati! Assicurati che i dataset siano nella stessa cartella dell'app.")
+except ValueError as e:
+    st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
+except KeyError as e:
+    st.error(f"⚠️ Errore di lettura campi. Se l'errore è 'gas_mwh', ricarica la pagina. Errore originale: {e}")
+except Exception as e:
+    st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
