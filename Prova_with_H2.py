@@ -603,11 +603,131 @@ try:
     if deficit_max > 0.5:
         st.warning(f"⚠️ Attenzione: Durante la transizione, la mancanza di impianti pronti causa un picco di deficit (blackout) di **{deficit_max:.1f} TWh**. Valuta di accelerare le batterie o mantenere più gas di riserva.")
 
+
+
 # ==========================================
 # GESTIONE ERRORI
 # ==========================================
 except FileNotFoundError:
     st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella dell'app.")
+except ValueError as e:
+    st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
+except KeyError as e:
+    st.error(f"⚠️ Struttura dei dataset non compatibile con i pesi geografici configurati: {e}")
+except Exception as e:
+    st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
+
+    # ... (fine della sezione 5 sui grafici ad area) ...
+    deficit_max = df_t['Deficit_TWh'].max()
+    if deficit_max > 0.5:
+        st.warning(f"⚠️ Attenzione: Durante la transizione, la mancanza di impianti pronti causa un picco di deficit (blackout) di **{deficit_max:.1f} TWh**. Valuta di accelerare le batterie o mantenere più gas di riserva.")
+
+    # ==========================================
+    # 6. MODULO IDROGENO: L'ULTIMO MIGLIO (ZERO GAS)
+    # ==========================================
+    st.markdown("---")
+    st.header("🧪 L'Ultimo Miglio: Azzerare il Gas con l'Idrogeno (H₂)")
+    st.markdown("Il gas residuo usato per coprire i buchi di produzione può essere sostituito da idrogeno verde o rosa, stoccato stagionalmente in caverne di sale. **Qual è la via più economica per produrlo?**")
+
+    # Layout a colonne per i parametri H2
+    hc1, hc2, hc3, hc4 = st.columns(4)
+    eff_fuel_cell = hc1.slider("Efficienza Riconversione (H₂ -> Rete) [%]", 40.0, 70.0, 55.0, step=1.0) / 100
+    capex_elc = hc2.slider("CAPEX Elettrolizzatore [€/kW]", 500, 2000, 1000, step=100)
+    capex_salt_cavern = hc3.slider("CAPEX Stoccaggio (Caverne) [€/kg]", 0.5, 5.0, 1.5, step=0.1)
+    p_out_bar = hc4.number_input("Pressione Stoccaggio [bar]", min_value=50, max_value=700, value=200)
+
+    # STEP 1: DIMENSIONAMENTO DEL FABBISOGNO
+    gas_da_sostituire_twh = miglior_config['gas_mwh'] / 1e6
+    energia_el_necessaria_twh = gas_da_sostituire_twh / eff_fuel_cell
+    
+    kwh_per_kg_h2_chimico = 120 / 3.6 
+    h2_necessario_kton = (energia_el_necessaria_twh * 1e9) / kwh_per_kg_h2_chimico / 1e6
+
+    lavoro_compressore_kwh_kg = (14960 * 293.15 / 0.75 * (((p_out_bar * 1e5) / (30 * 1e5)) ** (0.4 / 1.4))) / 1e3 / 3600
+    
+    if gas_da_sostituire_twh <= 0.1:
+        st.success("🎉 Complimenti! La configurazione scelta non usa quasi più gas. Non serve un piano idrogeno massivo.")
+    else:
+        st.info(f"🎯 **Target:** Per sostituire {gas_da_sostituire_twh:.1f} TWh di gas termico, servono **{h2_necessario_kton:.1f} kton di Idrogeno** (richiedono {energia_el_necessaria_twh:.1f} TWh elettrici lordi dal nuovo impianto).")
+
+        # STEP 2 & 3: CONFRONTO TECNOLOGIE E RECUPERO CURTAILMENT
+        eta_nominale = 0.65 
+        energia_el_input_h2_twh = energia_el_necessaria_twh / eta_nominale
+        overgen_disp_twh = miglior_config['Overgen_TWh']
+        
+        # OPZIONE A: NUCLEARE DEDICATO (H2 Rosa)
+        cf_nuc = 0.92
+        taglia_elc_nuc_gw = energia_el_input_h2_twh / (8760 * cf_nuc)
+        curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, taglia_elc_nuc_gw * 8760 * 0.1)
+        energia_da_pagare_nuc_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_nuc_twh)
+        
+        costo_energia_nuc_mln = energia_da_pagare_nuc_twh * 1e6 * mercato['cfd_nuc']
+        capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * 1e6 * capex_elc
+        
+        # OPZIONE B: RINNOVABILI DEDICATE (H2 Verde)
+        cf_vre = 0.30
+        taglia_elc_vre_gw = energia_el_input_h2_twh / (8760 * cf_vre)
+        curtailment_recuperato_vre_twh = min(overgen_disp_twh * 0.7, taglia_elc_vre_gw * 8760 * 0.5)
+        energia_da_pagare_vre_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_vre_twh)
+        
+        lcoe_vre_medio = (mercato['cfd_pv'] * 0.6) + (mercato['cfd_wind'] * 0.4) 
+        costo_energia_vre_mln = energia_da_pagare_vre_twh * 1e6 * lcoe_vre_medio
+        capex_tot_elc_vre_mln = taglia_elc_vre_gw * 1e6 * capex_elc
+
+        # STEP 4: STOCCAGGIO E COMPRESSIONE 
+        capacita_stoccaggio_kton = h2_necessario_kton * 0.30 
+        capex_stoccaggio_mln = capacita_stoccaggio_kton * 1e6 * capex_salt_cavern / 1e6
+        costo_compressione_mln = (h2_necessario_kton * 1e6) * lavoro_compressore_kwh_kg * (mercato['cfd_pv']/1000) / 1e6 
+
+        # ANNUALIZZAZIONE COSTI (LCOH)
+        wacc = mercato['wacc_bess']
+        vita_elc = 20
+        crf_elc = (wacc * (1 + wacc)**vita_elc) / ((1 + wacc)**vita_elc - 1) if wacc > 0 else 1/vita_elc
+        
+        costo_annuo_nuc_mln = (capex_tot_elc_nuc_mln * crf_elc) + costo_energia_nuc_mln + (capex_stoccaggio_mln * crf_elc) + costo_compressione_mln
+        costo_annuo_vre_mln = (capex_tot_elc_vre_mln * crf_elc) + costo_energia_vre_mln + (capex_stoccaggio_mln * crf_elc) + costo_compressione_mln
+        
+        lcoh_nuc = (costo_annuo_nuc_mln * 1e6) / (h2_necessario_kton * 1e6)
+        lcoh_vre = (costo_annuo_vre_mln * 1e6) / (h2_necessario_kton * 1e6)
+
+        # VISUALIZZAZIONE RISULTATI
+        col_res1, col_res2 = st.columns(2)
+        with col_res1:
+            st.markdown("### ⚛️ Opzione A: Nucleare Dedicato")
+            st.markdown(f"- **Taglia Elettrolizzatore:** {taglia_elc_nuc_gw:.1f} GW (Basso CAPEX)")
+            st.markdown(f"- **Spreco di rete recuperato:** {curtailment_recuperato_nuc_twh:.1f} TWh")
+            st.metric("Costo Livellato H₂ (LCOH)", f"{lcoh_nuc:.2f} €/kg", delta="Efficienza Piatta", delta_color="off")
+            
+        with col_res2:
+            st.markdown("### 🌬️☀️ Opzione B: VRE Dedicato")
+            st.markdown(f"- **Taglia Elettrolizzatore:** {taglia_elc_vre_gw:.1f} GW (Alto CAPEX per basso CF)")
+            st.markdown(f"- **Spreco di rete recuperato:** {curtailment_recuperato_vre_twh:.1f} TWh")
+            st.metric("Costo Livellato H₂ (LCOH)", f"{lcoh_vre:.2f} €/kg", delta="Dipende dal meteo", delta_color="off")
+
+        # Grafico a cascata dei costi
+        df_h2_costi = pd.DataFrame({
+            'Voce': ['CAPEX Elettrolizzatore', 'Acquisto Energia (OPEX)', 'CAPEX Stoccaggio Caverne', 'Compressione (OPEX)'],
+            'Nucleare (Milioni €/anno)': [capex_tot_elc_nuc_mln * crf_elc, costo_energia_nuc_mln, capex_stoccaggio_mln * crf_elc, costo_compressione_mln],
+            'Rinnovabili (Milioni €/anno)': [capex_tot_elc_vre_mln * crf_elc, costo_energia_vre_mln, capex_stoccaggio_mln * crf_elc, costo_compressione_mln]
+        })
+        df_h2_melted = df_h2_costi.melt(id_vars='Voce', var_name='Scenario', value_name='Milioni €/anno')
+        
+        fig_h2 = px.bar(df_h2_melted, x='Scenario', y='Milioni €/anno', color='Voce', barmode='stack',
+                        title="Scomposizione del Costo Annuo per l'Idrogeno (LCOH totale)",
+                        color_discrete_sequence=px.colors.qualitative.Set2)
+        st.plotly_chart(fig_h2, use_container_width=True)
+
+        # Impatto Finale in Bolletta
+        costo_minimo_h2_mln = min(costo_annuo_nuc_mln, costo_annuo_vre_mln)
+        impatto_reale_sistema = (costo_minimo_h2_mln * 1e6) / df_completo['Fabbisogno_MW'].sum()
+        
+        st.error(f"⚡ **Impatto Definitivo sul Sistema:** L'eliminazione totale del gas residuo costerà altri **{costo_minimo_h2_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale.")
+
+# ==========================================
+# GESTIONE ERRORI (IMPORTANTE: Mantenere l'indentazione a zero qui sotto!)
+# ==========================================
+except FileNotFoundError:
+    st.error("⚠️ File dati non trovati! Assicurati che i dataset siano nella stessa cartella dell'app.")
 except ValueError as e:
     st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
 except KeyError as e:
