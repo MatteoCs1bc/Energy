@@ -292,24 +292,20 @@ def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW_mw, target_mwh_el
     best_batt_gwh = 0.0
     best_recupero_mwh = 0.0
     
-    # TUTTE LE TAGLIE SONO ESPRESSE IN GW PER EVITARE BUG DI SCALA
-    elc_base_gw = (target_mwh_el / 8760.0) / 1000.0
-    ore_eq_vre = np.sum(vre_profile_1GW_mw) 
-    vre_base_gw = target_mwh_el / ore_eq_vre if ore_eq_vre > 0 else 10.0
-    
-    elc_gw_steps = np.linspace(elc_base_gw * 0.5, elc_base_gw * 5.0, 20)
-    vre_gw_steps = np.linspace(0.0, vre_base_gw * 2.0, 20)
-    batt_gwh_steps = np.linspace(0.0, vre_base_gw * 2.0, 15)
+    # Range di ricerca molto più ampio per l'elettrolizzatore
+    # Cerchiamo da 0.5 GW fino a 60 GW per forzare la ricerca dell'ottimo con lo scarto di rete
+    elc_gw_steps = np.linspace(1.0, 60.0, 30) 
+    # Permettiamo anche di avere POCHISSIMA rinnovabile dedicata (per vedere se scrocca tutto dalla rete)
+    vre_gw_steps = np.linspace(0.0, 30.0, 20)
+    batt_gwh_steps = np.linspace(0.0, 10.0, 10)
     
     ore_tot = len(overgen_array)
     
     for vre_gw in vre_gw_steps:
         costo_vre_eur = vre_gw * costo_annuo_vre_1gw_eur
         for elc_gw in elc_gw_steps:
-            # GW * 1,000,000 = kW ---> kW * €/kW = Euro
             costo_elc_eur = elc_gw * 1000000.0 * capex_elc_kw * crf 
             for batt_gwh in batt_gwh_steps:
-                # GWh * 1,000 = MWh ---> MWh * €/MWh = Euro
                 costo_batt_eur = batt_gwh * 1000.0 * capex_batt_mwh * crf 
                 
                 costo_tot_eur = costo_vre_eur + costo_elc_eur + costo_batt_eur
@@ -327,40 +323,47 @@ def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW_mw, target_mwh_el
                     p_vre = vre_profile_1GW_mw[t] * vre_gw
                     p_grid = overgen_array[t]
                     
-                    p_avail = p_vre + p_grid
+                    # LOGICA DI PRIORITÀ:
+                    # 1. Uso lo scarto di rete (GRATIS)
+                    # 2. Se non basta, uso la mia rinnovabile dedicata
+                    # 3. Se avanza spazio, carico batteria
+                    
+                    # Capacità di assorbimento istantanea dell'elettrolizzatore
+                    p_elc_max = elc_mw
+                    
+                    # Quanta energia di scarto posso prendere?
+                    usabile_da_grid = min(p_grid, p_elc_max)
+                    
+                    # Quanta capacità resta per la mia REN?
+                    capacita_residua = p_elc_max - usabile_da_grid
+                    usabile_da_vre = min(p_vre, capacita_residua)
+                    
+                    # E dalla batteria?
+                    capacita_residua_2 = capacita_residua - usabile_da_vre
                     p_discharge = 0.0
+                    if capacita_residua_2 > 0 and soc_mwh > 0:
+                        p_discharge = min(soc_mwh * eff, batt_mw, capacita_residua_2)
                     
-                    if p_avail < elc_mw and soc_mwh > 0:
-                        p_discharge = min(soc_mwh * eff, batt_mw, elc_mw - p_avail)
-                        
-                    p_tot = p_avail + p_discharge
+                    p_elc_effettivo = usabile_da_grid + usabile_da_vre + p_discharge
                     
-                    if p_tot >= elc_mw * 0.15:
-                        p_elc = min(p_tot, elc_mw)
-                        energia_assorbita_mwh += p_elc
-                        
-                        if p_vre >= p_elc:
-                            usato_grid = 0.0
-                            p_excess = p_vre - p_elc + p_grid
-                        else:
-                            if p_vre + p_grid >= p_elc:
-                                usato_grid = p_elc - p_vre
-                                p_excess = p_grid - usato_grid
-                            else:
-                                usato_grid = p_grid
-                                p_excess = 0.0
-                                
-                        recupero_grid_mwh += usato_grid
+                    # Cut-off 15%
+                    if p_elc_effettivo >= elc_mw * 0.15:
+                        energia_assorbita_mwh += p_elc_effettivo
+                        recupero_grid_mwh += usabile_da_grid
                         soc_mwh -= (p_discharge / eff)
                         
-                        if p_excess > 0 and soc_mwh < batt_gwh * 1000.0:
-                            charge = min(p_excess, batt_mw, (batt_gwh * 1000.0 - soc_mwh)/eff)
+                        # Carico batteria con l'avanzo della MIA rinnovabile (non con la rete)
+                        p_excess_vre = p_vre - usabile_da_vre
+                        if p_excess_vre > 0 and soc_mwh < batt_gwh * 1000.0:
+                            charge = min(p_excess_vre, batt_mw, (batt_gwh * 1000.0 - soc_mwh)/eff)
                             soc_mwh += charge * eff
                     else:
-                        if p_avail > 0 and soc_mwh < batt_gwh * 1000.0:
-                            charge = min(p_avail, batt_mw, (batt_gwh * 1000.0 - soc_mwh)/eff)
+                        # Se spento, provo a caricare batteria con tutto il possibile
+                        if p_vre > 0 and soc_mwh < batt_gwh * 1000.0:
+                            charge = min(p_vre, batt_mw, (batt_gwh * 1000.0 - soc_mwh)/eff)
                             soc_mwh += charge * eff
                             
+                # VERIFICA TARGET
                 if energia_assorbita_mwh >= target_mwh_el:
                     if costo_tot_eur < miglior_costo:
                         miglior_costo = costo_tot_eur
@@ -369,14 +372,7 @@ def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW_mw, target_mwh_el
                         best_batt_gwh = batt_gwh
                         best_recupero_mwh = recupero_grid_mwh
                         
-    if best_elc_gw == 0.0:
-        best_elc_gw = elc_base_gw * 3.0
-        best_vre_gw = vre_base_gw * 1.5
-        best_batt_gwh = 0.0
-        best_recupero_mwh = 0.0
-        
     return float(best_elc_gw), float(best_vre_gw), float(best_batt_gwh), float(best_recupero_mwh)
-
 @njit
 def ottimizza_h2_nucleare(overgen_array, target_mwh_el, capex_elc_kw, cfd_nuc, cf_nuc, crf):
     miglior_costo = 1e18
