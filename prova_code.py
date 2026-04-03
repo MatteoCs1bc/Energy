@@ -88,6 +88,15 @@ def _mappa_profilo_annuale_su_indice(profilo_orario, indice_target):
 @st.cache_data
 def leggi_gme(file_gme):
     df_gme = pd.read_excel(file_gme, engine='openpyxl')
+    
+    # Scudo: controllo base delle colonne
+    if len(df_gme.columns) < 3:
+        raise ValueError("Il file GME non ha abbastanza colonne (servono almeno Data, Ora e Volumi).")
+    
+    # Adattamento nomi colonne se non perfetti
+    if 'Ora' not in df_gme.columns:
+        df_gme.rename(columns={df_gme.columns[0]: 'Data', df_gme.columns[1]: 'Ora'}, inplace=True)
+        
     colonna_volumi = df_gme.columns[2]
 
     if df_gme[colonna_volumi].dtype == 'object':
@@ -103,6 +112,11 @@ def leggi_gme(file_gme):
     df_gme['Datetime'] = data_convertita + ore_aggiuntive
 
     df_gme = df_gme.dropna(subset=['Datetime', colonna_volumi]).copy()
+    
+    # Scudo: verifica che il dataframe non si sia svuotato
+    if df_gme.empty:
+        raise ValueError("Dopo la pulizia il dataset GME è risultato VUOTO. Controlla il formato delle date nel file Excel.")
+        
     df_gme.set_index('Datetime', inplace=True)
     df_gme.rename(columns={colonna_volumi: 'Fabbisogno_MW'}, inplace=True)
     return df_gme[['Fabbisogno_MW']]
@@ -259,6 +273,11 @@ def simula_tutti_scenari_fisici(array_pv, array_wind, array_fabbisogno):
 
 def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
     fabbisogno_tot_mwh = df_completo['Fabbisogno_MW'].sum()
+    
+    # Scudo: evita divisioni per zero se il dataset è corrotto
+    if fabbisogno_tot_mwh <= 0:
+        raise ValueError("Il fabbisogno totale calcolato è 0. Verifica l'unità di misura nel file GME.")
+
     ore_eq_pv = df_completo['Fattore_Capacita_PV'].sum()
     ore_eq_wind = df_completo['Fattore_Capacita_Wind'].sum()
     hydro_fluente_tot_mwh = 2500.0 * len(df_completo)
@@ -328,12 +347,17 @@ def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
 
     df_risultati = pd.DataFrame(storia)
 
-    # Logica Budget 5%: Scegliamo il più pulito entro il +5% del costo minimo assoluto
+    # Scudo per ricerca miglior configurazione
     min_costo = df_risultati['Costo_Bolletta'].min()
     soglia_prezzo = min_costo * 1.05
 
     scenari_ok = df_risultati[df_risultati['Costo_Bolletta'] <= soglia_prezzo]
-    miglior_config = scenari_ok.sort_values(by='Carbon_Intensity').iloc[0].to_dict()
+    
+    if scenari_ok.empty:
+        # Fallback assoluto
+        miglior_config = df_risultati.sort_values(by='Carbon_Intensity').iloc[0].to_dict()
+    else:
+        miglior_config = scenari_ok.sort_values(by='Carbon_Intensity').iloc[0].to_dict()
 
     return miglior_config, df_risultati
 
@@ -499,7 +523,7 @@ try:
         nuc_start = c4.number_input("Inizio Nucleare", 0, 40, 12, help="Richiede molti anni di permitting e costruzione.")
         nuc_end = c4.number_input("Fine Nucleare", 1, 50, 20)
 
-    # Identifica lo Status Quo IN MODO SICURO ordinando la tabella
+    # Scudo Status Quo
     status_quo = df_plot.sort_values(by=['PV_GW', 'Wind_GW', 'BESS_GWh', 'Nuc_GW']).iloc[0]
 
     array_pv = df_completo['Fattore_Capacita_PV'].to_numpy(dtype=np.float64)
@@ -582,8 +606,11 @@ try:
 # GESTIONE ERRORI
 # ==========================================
 except FileNotFoundError:
-    st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella di `app.py`.")
+    st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella dell'app.")
+except ValueError as e:
+    # Mostriamo direttamente l'errore se lo abbiamo "intercettato" noi
+    st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
 except KeyError as e:
     st.error(f"⚠️ Struttura dei dataset non compatibile con i pesi geografici configurati: {e}")
 except Exception as e:
-    st.error(f"⚠️ Errore durante l'elaborazione dei dati: {e}")
+    st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
