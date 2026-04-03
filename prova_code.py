@@ -161,7 +161,7 @@ def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
 
     prod_pv_array = produzione_pv * pv_mw
     prod_wind_array = produzione_wind * wind_mw
-    potenza_nucleare_costante = nucleare_mw * 0.90
+    potenza_nucleare_costante = nucleare_mw * 1
 
     gas_usato_totale = 0.0
     deficit_totale = 0.0
@@ -436,21 +436,10 @@ try:
     col3.metric("Nucleare Richiesto", f"{miglior_config['Nuc_GW']} GW")
     col4.metric("Batterie Richieste", f"{miglior_config['BESS_GWh']} GWh")
 
-   # 1. Calcolo la Domanda Totale (Fabbisogno) in TWh
-    fabbisogno_tot_twh = df_completo['Fabbisogno_MW'].sum() / 1e6
-    
-    # 2. Ricavo il gas in TWh usando la percentuale esatta calcolata dal motore
-    percentuale_gas = miglior_config['Gas_%']
-    gas_usato_twh = (percentuale_gas / 100) * fabbisogno_tot_twh
-
     st.markdown(
-        f"**Mix Impianti:** {miglior_config['PV_GW']} GW Solare | {miglior_config['Wind_GW']} GW Eolico <br>"
-        f"**Fabbisogno Totale:** {fabbisogno_tot_twh:.1f} TWh/anno | "
-        f"**Consumo Gas Residuo:** <span style='color:red;'><b>{gas_usato_twh:.1f} TWh/anno</b></span> ({percentuale_gas:.1f}%) | "
-        f"**Spreco Rete:** {miglior_config['Overgen_TWh']:.1f} TWh/anno",
-        unsafe_allow_html=True
+        f"**Mix Impianti:** {miglior_config['PV_GW']} GW Solare | {miglior_config['Wind_GW']} GW Eolico | "
+        f"**Spreco Rete:** {miglior_config['Overgen_TWh']:.1f} TWh/anno"
     )
-
     st.caption(
         f"Curve usate nel calcolo: FV NORD {quota_fotovoltaico_nord_pct:.2f}% / SUD {100 - quota_fotovoltaico_nord_pct:.2f}% | "
         f"Eolico NORD {quota_eolico_nord_pct:.2f}% / SUD {100 - quota_eolico_nord_pct:.2f}%"
