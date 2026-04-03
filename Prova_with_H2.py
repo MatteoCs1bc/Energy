@@ -608,23 +608,23 @@ try:
     st.header("🏭 L'Ultimo Miglio: Power-to-Gas (Metano Sintetico)")
     st.markdown("Invece di costruire costose caverne per l'idrogeno puro, usiamo la $CO_2$ biogenica per trasformare l'idrogeno in metano sintetico ($e-CH_4$). Lo stocchiamo gratis nella rete gas nazionale esistente e usiamo le attuali centrali. **Qual è il Costo di questo Gas Sintetico rispetto a quello fossile?**")
 
-    # Layout a colonne per i parametri PtG (Dati da Moccia, Korberg, Shirizadeh)
+    # Layout a colonne per i parametri PtG
     hc1, hc2, hc3, hc4 = st.columns(4)
     eff_meth = hc1.slider("Efficienza Metanazione (H₂ -> CH₄) [%]", 70.0, 90.0, 78.0, step=1.0) / 100
     costo_co2 = hc2.slider("Costo CO₂ Biogenica [€/ton]", 0, 150, 70, step=5)
     capex_elc = hc3.slider("CAPEX Elettrolizzatore [€/kW]", 500, 2000, 1000, step=100)
     capex_meth = hc4.slider("CAPEX Metanatore [€/kW]", 200, 1000, 480, step=10)
 
-    # STEP 1: DIMENSIONAMENTO DEL FABBISOGNO (TERMODINAMICA E STECHIOMETRIA)
+    # STEP 1: DIMENSIONAMENTO DEL FABBISOGNO
     gas_da_sostituire_twh = miglior_config['gas_mwh'] / 1e6
     
-    # Quanta energia H2 serve prima della perdita di conversione in metano?
     energia_el_necessaria_h2_twh = gas_da_sostituire_twh / eff_meth
     
-    # Stechiometria: 1 MWh di CH4 (LHV) genera ~0.2 tonnellate di CO2. 
-    # Per la reazione inversa servono 0.198 tonnellate di CO2 per ogni MWh termico di CH4 prodotto.
+    # 0.198 tonnellate di CO2 per ogni MWh termico di CH4
     co2_necessaria_kton = (gas_da_sostituire_twh * 1e6) * 0.198 / 1000
-    costo_fornitura_co2_mln = co2_necessaria_kton * costo_co2 
+    
+    # FIX ARITMETICO: kton * 1000 = tonnellate. tonnellate * €/ton = Euro. Euro / 1.000.000 = Milioni di Euro.
+    costo_fornitura_co2_mln = (co2_necessaria_kton * 1000 * costo_co2) / 1e6 
 
     if gas_da_sostituire_twh <= 0.1:
         st.success("🎉 Complimenti! La configurazione scelta non usa quasi più gas. Non serve un piano Power-to-Gas massivo.")
@@ -632,7 +632,7 @@ try:
         st.info(f"🎯 **Target:** Per produrre {gas_da_sostituire_twh:.1f} TWh di Metano Sintetico servono **{energia_el_necessaria_h2_twh:.1f} TWh di Idrogeno** e **{co2_necessaria_kton:.1f} kton di CO₂ biogenica**.")
 
         # STEP 2: CONFRONTO TECNOLOGIE ELETTROLISI E RECUPERO CURTAILMENT
-        eta_nominale_elc = 0.65 # Efficienza elettrolizzatore (media dal tuo polinomio)
+        eta_nominale_elc = 0.65 
         energia_el_input_twh = energia_el_necessaria_h2_twh / eta_nominale_elc
         overgen_disp_twh = miglior_config['Overgen_TWh']
         
@@ -655,19 +655,17 @@ try:
         costo_energia_vre_mln = energia_da_pagare_vre_twh * lcoe_vre_medio
         capex_tot_elc_vre_mln = taglia_elc_vre_gw * capex_elc
 
-        # STEP 3: COSTI METANATORE E BUFFER CO2 (Modello Moccia)
-        # Assumiamo che il metanatore lavori in modo continuo (CF = 90%)
+        # STEP 3: COSTI METANATORE E BUFFER CO2
         taglia_meth_gw = (gas_da_sostituire_twh * 1000) / (8760 * 0.90)
         capex_tot_meth_mln = taglia_meth_gw * capex_meth
         
-        opex_fix_meth_mln = capex_tot_meth_mln * 0.035 # 3.5% del CAPEX
-        opex_var_meth_mln = (gas_da_sostituire_twh * 1e6) * 5.44 / 1e6 # 5.44 €/MWh
+        opex_fix_meth_mln = capex_tot_meth_mln * 0.035
+        opex_var_meth_mln = (gas_da_sostituire_twh * 1e6) * 5.44 / 1e6 
         
-        # Buffer CO2 (Serbatoi per 3 giorni di stoccaggio operativo a 2528 €/t)
         co2_buffer_kton = co2_necessaria_kton * (3 / 365)
-        capex_co2_storage_mln = co2_buffer_kton * 1000 * 2528 / 1e6
+        capex_co2_storage_mln = (co2_buffer_kton * 1000 * 2528) / 1e6
 
-        # STEP 4: LCO_CH4 (Levelized Cost of Synthetic Methane)
+        # STEP 4: LCO_CH4 
         wacc = mercato['wacc_bess']
         vita_impianti = 20
         crf = (wacc * (1 + wacc)**vita_impianti) / ((1 + wacc)**vita_impianti - 1) if wacc > 0 else 1/vita_impianti
@@ -677,7 +675,6 @@ try:
         costo_annuo_nuc_mln = (capex_tot_elc_nuc_mln * crf) + costo_energia_nuc_mln + costo_annuo_meth_mln
         costo_annuo_vre_mln = (capex_tot_elc_vre_mln * crf) + costo_energia_vre_mln + costo_annuo_meth_mln
         
-        # Costo del gas sintetico in €/MWh
         lco_ch4_nuc = (costo_annuo_nuc_mln * 1e6) / (gas_da_sostituire_twh * 1e6)
         lco_ch4_vre = (costo_annuo_vre_mln * 1e6) / (gas_da_sostituire_twh * 1e6)
 
@@ -717,15 +714,3 @@ try:
         impatto_reale_sistema = (costo_minimo_ptg_mln * 1e6) / df_completo['Fabbisogno_MW'].sum()
         
         st.error(f"⚡ **Impatto Definitivo sul Sistema:** Produrre in casa il metano sintetico per spegnere l'ultimo miglio fossile costerà **{costo_minimo_ptg_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale calcolata in alto.")
-
-# ==========================================
-# GESTIONE ERRORI
-# ==========================================
-except FileNotFoundError:
-    st.error("⚠️ File dati non trovati! Assicurati che i dataset siano nella stessa cartella dell'app.")
-except ValueError as e:
-    st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
-except KeyError as e:
-    st.error(f"⚠️ Errore di lettura campi. Se l'errore è 'gas_mwh', ricarica la pagina. Errore originale: {e}")
-except Exception as e:
-    st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
