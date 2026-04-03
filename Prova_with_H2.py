@@ -630,7 +630,7 @@ try:
     else:
         st.info(f"🎯 **Target:** Per produrre {gas_da_sostituire_twh:.1f} TWh di Metano Sintetico servono **{energia_el_necessaria_h2_twh:.1f} TWh di Idrogeno** e **{co2_necessaria_kton:.1f} kton di CO₂ biogenica**.")
 
-        # STEP 2: CONFRONTO TECNOLOGIE ELETTROLISI E RECUPERO CURTAILMENT
+    # STEP 2: CONFRONTO TECNOLOGIE ELETTROLISI E RECUPERO CURTAILMENT
         eta_nominale_elc = 0.65 
         energia_el_input_twh = energia_el_necessaria_h2_twh / eta_nominale_elc
         overgen_disp_twh = miglior_config['Overgen_TWh']
@@ -638,7 +638,9 @@ try:
         # OPZIONE A: NUCLEARE DEDICATO
         cf_nuc = 0.92
         taglia_elc_nuc_gw = (energia_el_input_twh * 1000) / (8760 * cf_nuc)
-        curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, (taglia_elc_nuc_gw / 1000) * 8760 * 0.1)
+        
+        # FIX: Aggiunto il limite massimo 'energia_el_input_twh'
+        curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, (taglia_elc_nuc_gw / 1000) * 8760 * 0.1, energia_el_input_twh)
         energia_da_pagare_nuc_twh = max(0, energia_el_input_twh - curtailment_recuperato_nuc_twh)
         
         costo_energia_nuc_mln = energia_da_pagare_nuc_twh * mercato['cfd_nuc']
@@ -647,7 +649,9 @@ try:
         # OPZIONE B: RINNOVABILI DEDICATE (Spugna)
         cf_vre = 0.30
         taglia_elc_vre_gw = (energia_el_input_twh * 1000) / (8760 * cf_vre)
-        curtailment_recuperato_vre_twh = min(overgen_disp_twh * 0.7, (taglia_elc_vre_gw / 1000) * 8760 * 0.5)
+        
+        # FIX: L'energia recuperata NON PUO' superare il 100% dell'energia necessaria
+        curtailment_recuperato_vre_twh = min(overgen_disp_twh * 0.7, (taglia_elc_vre_gw / 1000) * 8760 * 0.5, energia_el_input_twh)
         energia_da_pagare_vre_twh = max(0, energia_el_input_twh - curtailment_recuperato_vre_twh)
         
         lcoe_vre_medio = (mercato['cfd_pv'] * 0.6) + (mercato['cfd_wind'] * 0.4) 
