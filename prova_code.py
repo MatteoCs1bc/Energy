@@ -140,4 +140,476 @@ def carica_profili_rinnovabili(file_fotovoltaico, file_eolico):
         'pv_nord': pd.Series(_serie_pesata(df_pv, PV_WEIGHTS_NORD, scala=1000.0, clip_upper=1.0).values, index=df_pv.index, name='pv_nord'),
         'pv_sud': pd.Series(_serie_pesata(df_pv, PV_WEIGHTS_SUD, scala=1000.0, clip_upper=1.0).values, index=df_pv.index, name='pv_sud'),
         'wind_nord': pd.Series(_serie_pesata(df_wind, WIND_WEIGHTS_NORD, scala=1.0, clip_upper=1.0).values, index=df_wind.index, name='wind_nord'),
-        'wind_sud': pd.Series(_serie_pesata(df_wind
+        'wind_sud': pd.Series(_serie_pesata(df_wind, WIND_WEIGHTS_SUD, scala=1.0, clip_upper=1.0).values, index=df_wind.index, name='wind_sud'),
+    }
+    return profili
+
+
+@st.cache_data
+def carica_dati(file_fotovoltaico, file_gme, file_eolico, quota_pv_nord, quota_eolico_nord):
+    df_gme = leggi_gme(file_gme)
+    profili = carica_profili_rinnovabili(file_fotovoltaico, file_eolico)
+
+    quota_pv_nord = float(quota_pv_nord)
+    quota_eolico_nord = float(quota_eolico_nord)
+
+    profilo_pv = (profili['pv_nord'] * quota_pv_nord) + (profili['pv_sud'] * (1.0 - quota_pv_nord))
+    profilo_wind = (profili['wind_nord'] * quota_eolico_nord) + (profili['wind_sud'] * (1.0 - quota_eolico_nord))
+
+    df_completo = df_gme.copy()
+    df_completo['Fattore_Capacita_PV'] = _mappa_profilo_annuale_su_indice(profilo_pv, df_completo.index)
+    df_completo['Fattore_Capacita_Wind'] = _mappa_profilo_annuale_su_indice(profilo_wind, df_completo.index)
+
+    return df_completo.ffill()
+
+
+# ==========================================
+# 2. SIMULAZIONE FISICA (Numba)
+# ==========================================
+@njit
+def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
+                           pv_mw, wind_mw, nucleare_mw, bess_mwh, bess_mw, gas_mw,
+                           hydro_fluente_mw, hydro_bacino_mw, hydro_bacino_max_mwh, hydro_inflow_mw,
+                           efficienza_bess=0.9):
+    ore = len(fabbisogno)
+    soc_corrente = bess_mwh * 0.5
+    soc_hydro = hydro_bacino_max_mwh * 0.5
+
+    prod_pv_array = produzione_pv * pv_mw
+    prod_wind_array = produzione_wind * wind_mw
+    potenza_nucleare_costante = nucleare_mw * 1
+
+    gas_usato_totale = 0.0
+    deficit_totale = 0.0
+    overgen_totale = 0.0
+    hydro_dispatched_totale = 0.0
+    bess_scarica_totale = 0.0
+
+    sqrt_eff = np.sqrt(efficienza_bess)
+
+    for t in range(ore):
+        soc_hydro += hydro_inflow_mw
+        if soc_hydro > hydro_bacino_max_mwh:
+            soc_hydro = hydro_bacino_max_mwh
+
+        generazione_base = prod_pv_array[t] + prod_wind_array[t] + hydro_fluente_mw + potenza_nucleare_costante
+        bilancio_netto = generazione_base - fabbisogno[t]
+
+        if bilancio_netto > 0:
+            spazio_libero_batteria = bess_mwh - soc_corrente
+            potenza_assorbibile_max = spazio_libero_batteria / sqrt_eff
+            potenza_carica_effettiva = min(bilancio_netto, bess_mw, potenza_assorbibile_max)
+            soc_corrente += potenza_carica_effettiva * sqrt_eff
+            overgen_totale += (bilancio_netto - potenza_carica_effettiva)
+        else:
+            energia_richiesta = abs(bilancio_netto)
+
+            potenza_scarica_bess = min(energia_richiesta, bess_mw)
+            energia_out_bess = potenza_scarica_bess / sqrt_eff
+            if soc_corrente >= energia_out_bess:
+                soc_corrente -= energia_out_bess
+                energia_richiesta -= potenza_scarica_bess
+                bess_scarica_totale += potenza_scarica_bess
+            else:
+                energia_disp_bess = soc_corrente * sqrt_eff
+                soc_corrente = 0.0
+                energia_richiesta -= energia_disp_bess
+                bess_scarica_totale += energia_disp_bess
+
+            if energia_richiesta > 0:
+                potenza_scarica_hydro = min(energia_richiesta, hydro_bacino_mw)
+                if soc_hydro >= potenza_scarica_hydro:
+                    soc_hydro -= potenza_scarica_hydro
+                    energia_richiesta -= potenza_scarica_hydro
+                    hydro_dispatched_totale += potenza_scarica_hydro
+                else:
+                    hydro_dispatched_totale += soc_hydro
+                    energia_richiesta -= soc_hydro
+                    soc_hydro = 0.0
+
+            if energia_richiesta > 0:
+                uso_gas = min(energia_richiesta, gas_mw)
+                gas_usato_totale += uso_gas
+                deficit_totale += (energia_richiesta - uso_gas)
+
+    return gas_usato_totale, deficit_totale, overgen_totale, hydro_dispatched_totale, bess_scarica_totale
+
+
+# ==========================================
+# 3. MOTORE DI CALCOLO SEPARATO
+# ==========================================
+@st.cache_data
+def simula_tutti_scenari_fisici(array_pv, array_wind, array_fabbisogno):
+    scenari_pv_gw = [40, 50, 80, 100, 150]
+    scenari_wind_gw = [10, 20, 30, 60, 90]
+    scenari_bess_gwh = [10, 30, 50, 150, 300, 400]
+    scenari_nuc_gw = [0, 2, 5, 10, 15, 20, 25, 30]
+
+    GAS_CAPACITA_FISSA_MW = 50000
+    BESS_POTENZA_FISSA_MW = 50000
+    HYDRO_FLUENTE_MW = 2500.0
+    HYDRO_BACINO_MW = 12000.0
+    HYDRO_BACINO_MAX_MWH = 5000000.0
+    HYDRO_INFLOW_MW = 2850.0
+
+    risultati_fisici = []
+
+    for pv in scenari_pv_gw:
+        for wind in scenari_wind_gw:
+            for bess in scenari_bess_gwh:
+                for nuc in scenari_nuc_gw:
+                    gas_mwh, def_mwh, over_mwh, hydro_disp_mwh, bess_out_mwh = simula_rete_light_fast(
+                        array_pv, array_wind, array_fabbisogno,
+                        pv * 1000.0, wind * 1000.0, nuc * 1000.0, bess * 1000.0, BESS_POTENZA_FISSA_MW, GAS_CAPACITA_FISSA_MW,
+                        HYDRO_FLUENTE_MW, HYDRO_BACINO_MW, HYDRO_BACINO_MAX_MWH, HYDRO_INFLOW_MW
+                    )
+
+                    risultati_fisici.append({
+                        'PV_GW': pv, 'Wind_GW': wind, 'BESS_GWh': bess, 'Nuc_GW': nuc,
+                        'gas_mwh': gas_mwh, 'deficit_mwh': def_mwh, 'overgen_mwh': over_mwh,
+                        'hydro_disp_mwh': hydro_disp_mwh, 'bess_scarica_mwh': bess_out_mwh
+                    })
+
+    return risultati_fisici
+
+
+def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
+    fabbisogno_tot_mwh = df_completo['Fabbisogno_MW'].sum()
+    
+    if fabbisogno_tot_mwh <= 0:
+        raise ValueError("Il fabbisogno totale calcolato è 0. C'è un problema nella lettura del GME.")
+
+    ore_eq_pv = df_completo['Fattore_Capacita_PV'].sum()
+    ore_eq_wind = df_completo['Fattore_Capacita_Wind'].sum()
+    hydro_fluente_tot_mwh = 2500.0 * len(df_completo)
+
+    LCA_EMISSIONI = {'pv': 45.0, 'wind': 11.0, 'hydro': 24.0, 'nuc': 12.0, 'bess': 50.0, 'gas': 550.0}
+
+    wacc = mercato.get('wacc_bess', 0.05)
+    vita = mercato.get('bess_vita', 15)
+    opex_f_rate = mercato.get('bess_opex_fix', 0.015)
+
+    if wacc > 0:
+        crf = (wacc * (1 + wacc) ** vita) / ((1 + wacc) ** vita - 1)
+    else:
+        crf = 1 / vita
+
+    storia = []
+
+    for r in risultati_fisici:
+        pv_mw = r['PV_GW'] * 1000.0
+        wind_mw = r['Wind_GW'] * 1000.0
+        nuc_mw = r['Nuc_GW'] * 1000.0
+        bess_mwh = r['BESS_GWh'] * 1000.0
+
+        costo_pv = (pv_mw * ore_eq_pv) * mercato['cfd_pv']
+        costo_wind = (wind_mw * ore_eq_wind) * mercato['cfd_wind']
+        costo_hydro = (hydro_fluente_tot_mwh + r['hydro_disp_mwh']) * mercato['gas_eur_mwh']
+        costo_nuc = (nuc_mw * 1 * 8760) * mercato['cfd_nuc']
+
+        capex_investimento = bess_mwh * mercato['bess_capex']
+        costo_bess = (capex_investimento * crf) + (capex_investimento * opex_f_rate)
+
+        lcos = costo_bess / r['bess_scarica_mwh'] if r['bess_scarica_mwh'] > 0 else 0.0
+
+        energia_vre_totale = (pv_mw * ore_eq_pv) + (wind_mw * ore_eq_wind)
+        quota_vre = energia_vre_totale / fabbisogno_tot_mwh
+
+        costo_base_integr = mercato['costo_base_integrazione'] * (quota_vre ** 2)
+        potenza_media_carico = fabbisogno_tot_mwh / 8760
+        rapporto_bess = (r['BESS_GWh'] * 1000) / potenza_media_carico
+        sconto_bess = min(0.5, rapporto_bess / 5.0)
+
+        costo_sistema_totale = energia_vre_totale * (costo_base_integr * (1 - sconto_bess))
+
+        costo_gas = r['gas_mwh'] * mercato['gas_eur_mwh']
+        costo_blackout = r['deficit_mwh'] * mercato['voll']
+
+        costo_bolletta = (costo_pv + costo_wind + costo_hydro + costo_nuc + costo_bess + costo_gas + costo_blackout + costo_sistema_totale) / fabbisogno_tot_mwh
+        percentuale_gas = (r['gas_mwh'] / fabbisogno_tot_mwh) * 100
+
+        emi_tot = ((pv_mw * ore_eq_pv) * LCA_EMISSIONI['pv'] +
+                   (wind_mw * ore_eq_wind) * LCA_EMISSIONI['wind'] +
+                   (hydro_fluente_tot_mwh + r['hydro_disp_mwh']) * LCA_EMISSIONI['hydro'] +
+                   (nuc_mw * 1 * 8760) * LCA_EMISSIONI['nuc'] +
+                   r['bess_scarica_mwh'] * LCA_EMISSIONI['bess'] +
+                   r['gas_mwh'] * LCA_EMISSIONI['gas'])
+        carbon_intensity = emi_tot / fabbisogno_tot_mwh
+
+        storia.append({
+            'Configurazione': f"{r['PV_GW']}PV|{r['Wind_GW']}W|{r['BESS_GWh']}B|{r['Nuc_GW']}N",
+            'PV_GW': r['PV_GW'], 'Wind_GW': r['Wind_GW'], 'BESS_GWh': r['BESS_GWh'], 'Nuc_GW': r['Nuc_GW'],
+            'Costo_Bolletta': costo_bolletta,
+            'Carbon_Intensity': carbon_intensity,
+            'Gas_%': percentuale_gas,
+            'LCOS_BESS': lcos,
+            'Overgen_TWh': r['overgen_mwh'] / 1e6
+        })
+
+    df_risultati = pd.DataFrame(storia)
+
+    # Scudo Budget 5%
+    min_costo = df_risultati['Costo_Bolletta'].min()
+    soglia_prezzo = min_costo * 1.05
+
+    scenari_ok = df_risultati[df_risultati['Costo_Bolletta'] <= soglia_prezzo]
+    
+    if scenari_ok.empty:
+        miglior_config = df_risultati.sort_values(by='Carbon_Intensity').iloc[0].to_dict()
+    else:
+        miglior_config = scenari_ok.sort_values(by='Carbon_Intensity').iloc[0].to_dict()
+
+    return miglior_config, df_risultati
+
+
+# ==========================================
+# 4. INTERFACCIA UTENTE (STREAMLIT)
+# ==========================================
+st.title("⚡ Ottimizzatore Mix Energetico e Decarbonizzazione (BETA)")
+st.markdown("Scopri l'equilibrio tra Rinnovabili, Batterie e Nucleare valutando le emissioni dell'intero ciclo di vita.")
+
+@st.dialog("📖 Come funziona questo simulatore?")
+def mostra_spiegazione():
+    st.markdown("""
+    **Benvenuto nel Simulatore di Mix Energetico 1.0 di CS1BC!**
+    per smanettare coi parametri clicca le freccette in alto a sinistra e aggiorni il risultato della funzione obiettivo
+    Cos'è CS1BC? è un collettivo strafigo! unbelclima.it
+
+    ATTENZIONE!:
+    i dataset di produzione rinnovabile sono reali ora per ora e ora usano una **media geografica pesata NORD/SUD**.
+    Puoi regolare dalla sidebar la quota di NORD per il fotovoltaico e per l'eolico.
+
+    ### 🌿 Modello LCA (Life Cycle Assessment)
+    Le emissioni sono calcolate sull'intero ciclo di vita (dati IPCC):
+    - **Fotovoltaico:** 45 gCO₂/kWh
+    - **Eolico:** 11 gCO₂/kWh
+    - **Idroelettrico:** 24 gCO₂/kWh
+    - **Nucleare:** 12 gCO₂/kWh
+    - **Batterie:** 50 gCO₂/kWh (per energia erogata)
+    - **Gas Naturale:** 550 gCO₂/kWh
+    *Si tratta di una Beta vibecodata, se vuoi darmi una mano a svilupparla scrivi a giovanni at unbelclima punto it*
+    *guarda il modello su: https://github.com/GioviCS1BC/simulatore_mix/ *
+    """)
+
+col_vuota, col_bottone = st.columns([4, 1])
+with col_bottone:
+    if st.button("ℹ️ Info / Istruzioni / Fonti"):
+        mostra_spiegazione()
+
+st.sidebar.header("🗺️ Mix geografico delle curve")
+quota_eolico_nord_pct = st.sidebar.slider(
+    "% eolico NORD", min_value=0.0, max_value=100.0, value=round(DEFAULT_WIND_NORD_SHARE * 100, 2), step=0.1,
+    help="La quota SUD è calcolata automaticamente come 100 - quota NORD."
+)
+quota_fotovoltaico_nord_pct = st.sidebar.slider(
+    "% fotovoltaico NORD", min_value=0.0, max_value=100.0, value=round(DEFAULT_PV_NORD_SHARE * 100, 2), step=0.1,
+    help="La quota SUD è calcolata automaticamente come 100 - quota NORD."
+)
+st.sidebar.caption(
+    f"Default realistici: FV NORD {DEFAULT_PV_NORD_SHARE * 100:.2f}% | FV SUD {(1 - DEFAULT_PV_NORD_SHARE) * 100:.2f}% | "
+    f"Eolico NORD {DEFAULT_WIND_NORD_SHARE * 100:.2f}% | Eolico SUD {(1 - DEFAULT_WIND_NORD_SHARE) * 100:.2f}%"
+)
+
+st.sidebar.header("⚙️ Parametri di Mercato")
+mercato = {
+    'cfd_pv': st.sidebar.slider("CfD Fotovoltaico (€/MWh)", 20.0, 150.0, 60.0, step=5.0),
+    'cfd_wind': st.sidebar.slider("CfD Eolico (€/MWh)", 30.0, 150.0, 80.0, step=5.0),
+    'cfd_nuc': st.sidebar.slider("CfD Nucleare (€/MWh)", 50.0, 200.0, 120.0, step=5.0),
+    'bess_capex': st.sidebar.slider("CAPEX Batterie (€/MWh installato)", 50000.0, 300000.0, 100000.0, step=10000.0),
+    'wacc_bess': st.sidebar.slider("WACC Batterie (%)", 0.0, 15.0, 5.0, step=0.5) / 100,
+    'bess_opex_fix': st.sidebar.slider("Manutenzione Annua BESS (% del CAPEX)", 0.0, 5.0, 1.5, step=0.1) / 100,
+    'bess_vita': 15,
+    'gas_eur_mwh': st.sidebar.slider("Prezzo Gas / Fossili (€/MWh)", 30.0, 300.0, 130.0, step=10.0),
+    'costo_base_integrazione': st.sidebar.slider(
+        "Costo Integrazione Rete (€/MWh)", 0.0, 20.0, 10.0,
+        help="Costo extra per bilanciamento e rete per gestire fotovoltaico ed eolico."
+    ),
+    'voll': 3000.0
+}
+
+try:
+    cartella_script = os.path.dirname(os.path.abspath(__file__))
+    file_fotovoltaico = os.path.join(cartella_script, "dataset_fotovoltaico_produzione.csv")
+    file_gme = os.path.join(cartella_script, "gme.xlsx")
+    file_eolico = os.path.join(cartella_script, "dataset_eolico_produzione.csv")
+
+    quota_fotovoltaico_nord = quota_fotovoltaico_nord_pct / 100.0
+    quota_eolico_nord = quota_eolico_nord_pct / 100.0
+
+    df_completo = carica_dati(
+        file_fotovoltaico,
+        file_gme,
+        file_eolico,
+        quota_fotovoltaico_nord,
+        quota_eolico_nord,
+    )
+
+    with st.spinner("Calcolo della rete elettrica... (Solo al primo avvio o quando cambia la geografia delle curve)"):
+        risultati_fisici = simula_tutti_scenari_fisici(
+            df_completo['Fattore_Capacita_PV'].to_numpy(dtype=np.float64),
+            df_completo['Fattore_Capacita_Wind'].to_numpy(dtype=np.float64),
+            df_completo['Fabbisogno_MW'].to_numpy(dtype=np.float64),
+        )
+
+    miglior_config, df_plot = applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato)
+
+    st.subheader("🏆 Il Miglior Compromesso (Ottimo Economico + 5% Tolleranza Green)")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Costo Bolletta", f"{miglior_config['Costo_Bolletta']:.1f} €/MWh")
+    col2.metric("Carbon Intensity (LCA)", f"{miglior_config['Carbon_Intensity']:.1f} gCO₂/kWh")
+    col3.metric("Nucleare Richiesto", f"{miglior_config['Nuc_GW']} GW")
+    col4.metric("Batterie Richieste", f"{miglior_config['BESS_GWh']} GWh")
+
+    st.markdown(
+        f"**Mix Impianti:** {miglior_config['PV_GW']} GW Solare | {miglior_config['Wind_GW']} GW Eolico | "
+        f"**Spreco Rete:** {miglior_config['Overgen_TWh']:.1f} TWh/anno"
+    )
+    st.caption(
+        f"Curve usate nel calcolo: FV NORD {quota_fotovoltaico_nord_pct:.2f}% / SUD {100 - quota_fotovoltaico_nord_pct:.2f}% | "
+        f"Eolico NORD {quota_eolico_nord_pct:.2f}% / SUD {100 - quota_eolico_nord_pct:.2f}%"
+    )
+
+    st.subheader("📊 Frontiera di Pareto: Costi vs Emissioni (Interattivo!)")
+
+    fig = px.scatter(
+        df_plot,
+        x='Carbon_Intensity',
+        y='Costo_Bolletta',
+        color='Nuc_GW',
+        color_continuous_scale='Plasma',
+        hover_data=['PV_GW', 'Wind_GW', 'BESS_GWh'],
+        labels={
+            'Carbon_Intensity': "Carbon Intensity Media LCA (gCO₂/kWh)",
+            'Costo_Bolletta': "Costo Medio in Bolletta (€/MWh)",
+            'Nuc_GW': "Nucleare (GW)"
+        }
+    )
+
+    fig.add_trace(go.Scatter(
+        x=[miglior_config['Carbon_Intensity']],
+        y=[miglior_config['Costo_Bolletta']],
+        mode='markers',
+        marker=dict(color='lime', size=15, line=dict(color='black', width=2)),
+        name='Ottimo Scelto',
+        hoverinfo='skip'
+    ))
+
+    fig.update_layout(xaxis_autorange="reversed", height=600)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ==========================================
+    # 5. TRAIETTORIA DI TRANSIZIONE E COSTO DEL RITARDO
+    # ==========================================
+    st.markdown("---")
+    st.subheader("🛤️ Traiettoria Reale: Il costo dell'attesa")
+    st.markdown("I ritardi burocratici o i lunghi tempi di costruzione hanno un costo occulto: **nel frattempo si brucia gas**. Modifica i tempi di cantiere per vedere quanti miliardi ci costa una transizione lenta.")
+    
+    col_t1, col_t2 = st.columns([1, 2])
+    with col_t1:
+        anni_transizione = st.slider("Orizzonte di transizione (Anni)", 10, 40, 20)
+    
+    with st.expander("⏱️ Personalizza i tempi di deploy (Inizio -> Fine Lavori)"):
+        st.caption("L'anno 'Inizio' è quando il primo GW entra in rete. L'anno 'Fine' è quando si raggiunge il target del Mix Ottimo.")
+        c1, c2, c3, c4 = st.columns(4)
+        pv_start = c1.number_input("Inizio PV (Anno)", 0, 40, 1)
+        pv_end = c1.number_input("Fine PV (Anno)", 1, 40, 15)
+        
+        wind_start = c2.number_input("Inizio Eolico", 0, 40, 3)
+        wind_end = c2.number_input("Fine Eolico", 1, 40, 18)
+        
+        bess_start = c3.number_input("Inizio BESS", 0, 40, 1)
+        bess_end = c3.number_input("Fine BESS", 1, 40, 15)
+        
+        nuc_start = c4.number_input("Inizio Nucleare", 0, 40, 12, help="Richiede molti anni di permitting e costruzione.")
+        nuc_end = c4.number_input("Fine Nucleare", 1, 50, 20)
+
+    # Scudo Status Quo
+    status_quo = df_plot.sort_values(by=['PV_GW', 'Wind_GW', 'BESS_GWh', 'Nuc_GW']).iloc[0]
+
+    array_pv = df_completo['Fattore_Capacita_PV'].to_numpy(dtype=np.float64)
+    array_wind = df_completo['Fattore_Capacita_Wind'].to_numpy(dtype=np.float64)
+    array_fabbisogno = df_completo['Fabbisogno_MW'].to_numpy(dtype=np.float64)
+    
+    def calcola_capacita_anno(anno, start_yr, end_yr, val_start, val_target, step_wise=False):
+        if end_yr <= start_yr: 
+            end_yr = start_yr + 1 
+            
+        if anno <= start_yr:
+            return val_start
+        elif anno >= end_yr:
+            return val_target
+        else:
+            quota = (anno - start_yr) / (end_yr - start_yr)
+            valore = val_start + (val_target - val_start) * quota
+            if step_wise:
+                return np.floor(valore)
+            return valore
+
+    storia_transizione = []
+    costo_gas_cumulato_mld = 0.0
+
+    for anno in range(anni_transizione + 1):
+        pv_gw = calcola_capacita_anno(anno, pv_start, pv_end, status_quo['PV_GW'], miglior_config['PV_GW'])
+        wind_gw = calcola_capacita_anno(anno, wind_start, wind_end, status_quo['Wind_GW'], miglior_config['Wind_GW'])
+        bess_gwh = calcola_capacita_anno(anno, bess_start, bess_end, status_quo['BESS_GWh'], miglior_config['BESS_GWh'])
+        nuc_gw = calcola_capacita_anno(anno, nuc_start, nuc_end, status_quo['Nuc_GW'], miglior_config['Nuc_GW'], step_wise=True)
+        
+        gas_mwh, def_mwh, over_mwh, _, _ = simula_rete_light_fast(
+            array_pv, array_wind, array_fabbisogno,
+            pv_gw * 1000.0, wind_gw * 1000.0, nuc_gw * 1000.0, bess_gwh * 1000.0, 
+            50000.0, 50000.0, 2500.0, 12000.0, 5000000.0, 2850.0
+        )
+        
+        costo_gas_anno_mld = (gas_mwh * mercato['gas_eur_mwh']) / 1e9
+        costo_gas_cumulato_mld += costo_gas_anno_mld
+        
+        storia_transizione.append({
+            'Anno': anno,
+            'PV_GW': pv_gw,
+            'Wind_GW': wind_gw,
+            'Nuc_GW': nuc_gw,
+            'BESS_GWh': bess_gwh,
+            'Gas_TWh': gas_mwh / 1e6,
+            'Costo_Gas_Mld': costo_gas_anno_mld,
+            'Deficit_TWh': def_mwh / 1e6
+        })
+
+    df_t = pd.DataFrame(storia_transizione)
+
+    st.error(f"💸 **Spesa Cumulata per il Gas durante la transizione:** {costo_gas_cumulato_mld:.1f} Miliardi di €")
+    st.caption(f"Questo è il costo generato dal bruciare gas negli anni intermedi, prima che tutti i nuovi impianti siano a regime. Se ritardi le autorizzazioni, questa cifra esplode.")
+
+    fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig2.add_trace(go.Scatter(x=df_t['Anno'], y=df_t['PV_GW'], mode='lines', stackgroup='one', name='Fotovoltaico (GW)', fillcolor='gold', line=dict(width=0.5)), secondary_y=False)
+    fig2.add_trace(go.Scatter(x=df_t['Anno'], y=df_t['Wind_GW'], mode='lines', stackgroup='one', name='Eolico (GW)', fillcolor='lightskyblue', line=dict(width=0.5)), secondary_y=False)
+    fig2.add_trace(go.Scatter(x=df_t['Anno'], y=df_t['Nuc_GW'], mode='lines', stackgroup='one', name='Nucleare (GW)', fillcolor='mediumpurple', line=dict(width=1.5, shape='hv')), secondary_y=False)
+    
+    fig2.add_trace(go.Scatter(x=df_t['Anno'], y=df_t['Gas_TWh'], mode='lines+markers', name='Consumo Gas (TWh)', line=dict(color='red', width=4), marker=dict(size=6)), secondary_y=True)
+
+    fig2.update_layout(
+        title="Dinamica di Costruzione e Riduzione del Gas",
+        xaxis_title="Anno di Transizione (0 = Oggi)",
+        hovermode="x unified",
+        height=500
+    )
+    fig2.update_yaxes(title_text="Capacità Installata (<b>GW</b>)", secondary_y=False)
+    fig2.update_yaxes(title_text="Gas Bruciato (<b>TWh/anno</b>)", secondary_y=True, range=[0, df_t['Gas_TWh'].max() * 1.1])
+
+    st.plotly_chart(fig2, use_container_width=True)
+    
+    deficit_max = df_t['Deficit_TWh'].max()
+    if deficit_max > 0.5:
+        st.warning(f"⚠️ Attenzione: Durante la transizione, la mancanza di impianti pronti causa un picco di deficit (blackout) di **{deficit_max:.1f} TWh**. Valuta di accelerare le batterie o mantenere più gas di riserva.")
+
+# ==========================================
+# GESTIONE ERRORI
+# ==========================================
+except FileNotFoundError:
+    st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella dell'app.")
+except ValueError as e:
+    st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
+except KeyError as e:
+    st.error(f"⚠️ Struttura dei dataset non compatibile con i pesi geografici configurati: {e}")
+except Exception as e:
+    st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
