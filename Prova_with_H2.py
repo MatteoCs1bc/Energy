@@ -87,19 +87,15 @@ def _mappa_profilo_annuale_su_indice(profilo_orario, indice_target):
 
 @st.cache_data
 def leggi_gme_radar(file_gme):
-    # La nuova funzione Radar Scanner (Ignora Cache Vecchia)
     try:
         df_gme = pd.read_excel(file_gme, engine='openpyxl', header=None)
-        
         miglior_serie = None
         max_somma = -1
         
-        # Scansiona tutte le colonne alla ricerca dei numeri
         for col in df_gme.columns:
             s = df_gme[col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
             s_num = pd.to_numeric(s, errors='coerce').dropna()
             
-            # Se la colonna ha almeno un anno di ore
             if len(s_num) >= 8760:
                 somma_corrente = s_num.sum()
                 if somma_corrente > max_somma:
@@ -114,12 +110,10 @@ def leggi_gme_radar(file_gme):
     except Exception:
         pass
     
-    # FALLBACK ASSOLUTO: Crea un profilo Italiano Standard se il GME fallisce
+    # FALLBACK: Profilo Italiano Standard
     ore = 8760
     idx = pd.date_range(start="2023-01-01 00:00", periods=ore, freq='h')
     t = np.arange(ore)
-    
-    # Base 25 GW + Ciclo Notte/Giorno 10 GW + Ciclo Stagionale 5 GW
     giorno_notte = 10000 * np.sin(2 * np.pi * t / 24 - np.pi/2)
     stagione = 5000 * np.sin(2 * np.pi * t / 8760 - np.pi/2)
     fabbisogno_finto = np.clip(25000 + giorno_notte + stagione, a_min=15000, a_max=60000)
@@ -279,6 +273,9 @@ def simula_tutti_scenari_fisici(array_pv, array_wind, array_fabbisogno):
 def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
     fabbisogno_tot_mwh = df_completo['Fabbisogno_MW'].sum()
     
+    if fabbisogno_tot_mwh <= 0:
+        raise ValueError("Il fabbisogno totale calcolato è 0. C'è un problema nella lettura del GME.")
+
     ore_eq_pv = df_completo['Fattore_Capacita_PV'].sum()
     ore_eq_wind = df_completo['Fattore_Capacita_Wind'].sum()
     hydro_fluente_tot_mwh = 2500.0 * len(df_completo)
@@ -524,7 +521,6 @@ try:
         nuc_start = c4.number_input("Inizio Nucleare", 0, 40, 12)
         nuc_end = c4.number_input("Fine Nucleare", 1, 50, 20)
 
-    # Scudo Status Quo
     status_quo = df_plot.sort_values(by=['PV_GW', 'Wind_GW', 'BESS_GWh', 'Nuc_GW']).iloc[0]
 
     array_pv = df_completo['Fattore_Capacita_PV'].to_numpy(dtype=np.float64)
@@ -603,24 +599,6 @@ try:
     if deficit_max > 0.5:
         st.warning(f"⚠️ Attenzione: Durante la transizione, la mancanza di impianti pronti causa un picco di deficit (blackout) di **{deficit_max:.1f} TWh**. Valuta di accelerare le batterie o mantenere più gas di riserva.")
 
-
-
-# ==========================================
-# GESTIONE ERRORI
-# ==========================================
-except FileNotFoundError:
-    st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella dell'app.")
-except ValueError as e:
-    st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
-except KeyError as e:
-    st.error(f"⚠️ Struttura dei dataset non compatibile con i pesi geografici configurati: {e}")
-except Exception as e:
-    st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
-
-    # ... (fine della sezione 5 sui grafici ad area) ...
-    deficit_max = df_t['Deficit_TWh'].max()
-    if deficit_max > 0.5:
-        st.warning(f"⚠️ Attenzione: Durante la transizione, la mancanza di impianti pronti causa un picco di deficit (blackout) di **{deficit_max:.1f} TWh**. Valuta di accelerare le batterie o mantenere più gas di riserva.")
 
     # ==========================================
     # 6. MODULO IDROGENO: L'ULTIMO MIGLIO (ZERO GAS)
@@ -724,135 +702,13 @@ except Exception as e:
         st.error(f"⚡ **Impatto Definitivo sul Sistema:** L'eliminazione totale del gas residuo costerà altri **{costo_minimo_h2_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale.")
 
 # ==========================================
-# GESTIONE ERRORI (IMPORTANTE: Mantenere l'indentazione a zero qui sotto!)
+# GESTIONE ERRORI
 # ==========================================
 except FileNotFoundError:
-    st.error("⚠️ File dati non trovati! Assicurati che i dataset siano nella stessa cartella dell'app.")
+    st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella dell'app.")
 except ValueError as e:
     st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
 except KeyError as e:
     st.error(f"⚠️ Struttura dei dataset non compatibile con i pesi geografici configurati: {e}")
 except Exception as e:
     st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
-
-# ==========================================
-    # 6. MODULO IDROGENO: L'ULTIMO MIGLIO (ZERO GAS)
-    # ==========================================
-    st.markdown("---")
-    st.header("🧪 L'Ultimo Miglio: Azzerare il Gas con l'Idrogeno (H₂)")
-    st.markdown("Il gas residuo usato per coprire i buchi di produzione può essere sostituito da idrogeno verde o rosa, stoccato stagionalmente in caverne di sale. **Qual è la via più economica per produrlo?**")
-
-    # Layout a colonne per i parametri H2
-    hc1, hc2, hc3, hc4 = st.columns(4)
-    eff_fuel_cell = hc1.slider("Efficienza Riconversione (H₂ -> Rete) [%]", 40.0, 70.0, 55.0, step=1.0) / 100
-    capex_elc = hc2.slider("CAPEX Elettrolizzatore [€/kW]", 500, 2000, 1000, step=100)
-    capex_salt_cavern = hc3.slider("CAPEX Stoccaggio (Caverne) [€/kg]", 0.5, 5.0, 1.5, step=0.1)
-    p_out_bar = hc4.number_input("Pressione Stoccaggio [bar]", min_value=50, max_value=700, value=200)
-
-    # STEP 1: DIMENSIONAMENTO DEL FABBISOGNO
-    # Quanta energia ci serve per rimpiazzare il gas residuo della configurazione ottima?
-    gas_da_sostituire_twh = miglior_config['gas_mwh'] / 1e6
-    energia_el_necessaria_twh = gas_da_sostituire_twh / eff_fuel_cell
-    
-    # Costante dal tuo codice: 120 MJ/kg / 3.6 = 33.33 kWh/kg
-    kwh_per_kg_h2_chimico = 120 / 3.6 
-    h2_necessario_kton = (energia_el_necessaria_twh * 1e9) / kwh_per_kg_h2_chimico / 1e6 # in kton (migliaia di tonnellate)
-
-    # Lavoro di compressione (Dal tuo codice)
-    # lc = (14960*293.15/0.75*(((P_out*10**5)/(3*10**6))**(((7/5)-1)/(7/5))))/1000  [in kWh/kg]
-    # Assumiamo P_in = 30 bar (3*10^6 Pa)
-    lavoro_compressore_kwh_kg = (14960 * 293.15 / 0.75 * (((p_out_bar * 1e5) / (30 * 1e5)) ** (0.4 / 1.4))) / 1e3 / 3600
-    
-    if gas_da_sostituire_twh <= 0.1:
-        st.success("🎉 Complimenti! La configurazione scelta non usa quasi più gas. Non serve un piano idrogeno massivo.")
-    else:
-        st.info(f"🎯 **Target:** Per sostituire {gas_da_sostituire_twh:.1f} TWh di gas, servono **{h2_necessario_kton:.1f} kton di Idrogeno** (richiedono {energia_el_necessaria_twh:.1f} TWh elettrici lordi).")
-
-        # STEP 2 & 3: CONFRONTO TECNOLOGIE E RECUPERO CURTAILMENT
-        # Assumiamo un'efficienza media operativa (eta) derivata dal tuo polinomio per carichi nominali ~ 65%
-        eta_nominale = 0.65 
-        energia_el_input_h2_twh = energia_el_necessaria_twh / eta_nominale
-        
-        # Recupero Opportunistico (Curtailment / Spreco)
-        overgen_disp_twh = miglior_config['Overgen_TWh']
-        
-        # OPZIONE A: NUCLEARE DEDICATO (H2 Rosa)
-        cf_nuc = 0.92
-        taglia_elc_nuc_gw = energia_el_input_h2_twh / (8760 * cf_nuc)
-        
-        # Il nucleare ha un profilo piatto, non riesce a catturare bene i picchi del curtailment FV/Wind.
-        # Assumiamo che catturi solo una frazione minima (es. 10%) del curtailment disponibile
-        curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, taglia_elc_nuc_gw * 8760 * 0.1)
-        energia_da_pagare_nuc_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_nuc_twh)
-        
-        costo_energia_nuc_mln = energia_da_pagare_nuc_twh * 1e6 * mercato['cfd_nuc']
-        capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * 1e6 * capex_elc
-        
-        # OPZIONE B: RINNOVABILI DEDICATE (H2 Verde)
-        # Mix FV/Wind ha un CF aggregato stimato di ~30%
-        cf_vre = 0.30
-        taglia_elc_vre_gw = energia_el_input_h2_twh / (8760 * cf_vre)
-        
-        # L'elettrolizzatore è enorme, quindi può assorbire enormi quantità di curtailment dalla rete
-        curtailment_recuperato_vre_twh = min(overgen_disp_twh * 0.7, taglia_elc_vre_gw * 8760 * 0.5)
-        energia_da_pagare_vre_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_vre_twh)
-        
-        lcoe_vre_medio = (mercato['cfd_pv'] * 0.6) + (mercato['cfd_wind'] * 0.4) # Mix grezzo
-        costo_energia_vre_mln = energia_da_pagare_vre_twh * 1e6 * lcoe_vre_medio
-        capex_tot_elc_vre_mln = taglia_elc_vre_gw * 1e6 * capex_elc
-
-        # STEP 4: STOCCAGGIO E COMPRESSIONE (Comuni a entrambe le opzioni)
-        # Assumiamo di dover stoccare il 30% della produzione annua per fare shift stagionale
-        capacita_stoccaggio_kton = h2_necessario_kton * 0.30 
-        capex_stoccaggio_mln = capacita_stoccaggio_kton * 1e6 * capex_salt_cavern / 1e6
-        
-        costo_compressione_mln = (h2_necessario_kton * 1e6) * lavoro_compressore_kwh_kg * (mercato['cfd_pv']/1000) / 1e6 # Assumendo di usare l'energia al prezzo del FV per comprimere
-
-        # ANNUALIZZAZIONE COSTI (LCOH)
-        wacc = mercato['wacc_bess']
-        vita_elc = 20
-        crf_elc = (wacc * (1 + wacc)**vita_elc) / ((1 + wacc)**vita_elc - 1) if wacc > 0 else 1/vita_elc
-        
-        costo_annuo_nuc_mln = (capex_tot_elc_nuc_mln * crf_elc) + costo_energia_nuc_mln + (capex_stoccaggio_mln * crf_elc) + costo_compressione_mln
-        costo_annuo_vre_mln = (capex_tot_elc_vre_mln * crf_elc) + costo_energia_vre_mln + (capex_stoccaggio_mln * crf_elc) + costo_compressione_mln
-        
-        lcoh_nuc = (costo_annuo_nuc_mln * 1e6) / (h2_necessario_kton * 1e6)
-        lcoh_vre = (costo_annuo_vre_mln * 1e6) / (h2_necessario_kton * 1e6)
-
-        # VISUALIZZAZIONE RISULTATI
-        col_res1, col_res2 = st.columns(2)
-        
-        with col_res1:
-            st.markdown("### ⚛️ Opzione A: Impianto Nucleare Dedicato")
-            st.markdown(f"- **Taglia Elettrolizzatore:** {taglia_elc_nuc_gw:.1f} GW (Basso CAPEX)")
-            st.markdown(f"- **Curtailment di rete recuperato:** {curtailment_recuperato_nuc_twh:.1f} TWh")
-            st.metric("Costo Livellato Idrogeno (LCOH)", f"{lcoh_nuc:.2f} €/kg", delta="Costante e Prevedibile", delta_color="off")
-            
-        with col_res2:
-            st.markdown("### 🌬️☀️ Opzione B: Impianto VRE Dedicato")
-            st.markdown(f"- **Taglia Elettrolizzatore:** {taglia_elc_vre_gw:.1f} GW (Alto CAPEX per basso CF)")
-            st.markdown(f"- **Curtailment di rete recuperato:** {curtailment_recuperato_vre_twh:.1f} TWh (L'elettrolizzatore grande fa da spugna)")
-            st.metric("Costo Livellato Idrogeno (LCOH)", f"{lcoh_vre:.2f} €/kg", delta="Dipende dal sole/vento", delta_color="off")
-
-        # Grafico a cascata (Waterfall) dei costi
-        df_h2_costi = pd.DataFrame({
-            'Voce': ['CAPEX Elettrolizzatore', 'Acquisto Energia (OPEX)', 'CAPEX Stoccaggio Caverne', 'Compressione'],
-            'Nucleare (Milioni €/anno)': [capex_tot_elc_nuc_mln * crf_elc, costo_energia_nuc_mln, capex_stoccaggio_mln * crf_elc, costo_compressione_mln],
-            'Rinnovabili (Milioni €/anno)': [capex_tot_elc_vre_mln * crf_elc, costo_energia_vre_mln, capex_stoccaggio_mln * crf_elc, costo_compressione_mln]
-        })
-        
-        df_h2_melted = df_h2_costi.melt(id_vars='Voce', var_name='Scenario', value_name='Milioni €/anno')
-        
-        fig_h2 = px.bar(df_h2_melted, x='Scenario', y='Milioni €/anno', color='Voce', barmode='stack',
-                        title="Scomposizione del Costo Annuo per la Produzione dell'Idrogeno Mancante",
-                        color_discrete_sequence=px.colors.qualitative.Set2)
-        
-        st.plotly_chart(fig_h2, use_container_width=True)
-
-        # Impatto Finale in Bolletta
-        costo_minimo_h2_mln = min(costo_annuo_nuc_mln, costo_annuo_vre_mln)
-        impatto_bolletta_eur_mwh = (costo_minimo_h2_mln * 1e6) / (miglior_config['gas_mwh'] + 1e-9) # Spalmiamo sui MWh totali
-        # Nota: L'impatto reale andrebbe spalmato su TUTTO il fabbisogno nazionale per vedere l'aumento del costo medio
-        impatto_reale_sistema = (costo_minimo_h2_mln * 1e6) / df_completo['Fabbisogno_MW'].sum()
-        
-        st.error(f"⚡ **Impatto sul Sistema:** L'eliminazione totale dell'ultimo miglio di gas costerà circa **{costo_minimo_h2_mln/1000:.2f} Miliardi di € all'anno**. Questo aggiungerà circa **{impatto_reale_sistema:.2f} €/MWh** alla bolletta media nazionale calcolata in precedenza.")
