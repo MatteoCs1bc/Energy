@@ -600,8 +600,7 @@ try:
     if deficit_max > 0.5:
         st.warning(f"⚠️ Attenzione: Durante la transizione, la mancanza di impianti pronti causa un picco di deficit (blackout) di **{deficit_max:.1f} TWh**. Valuta di accelerare le batterie o mantenere più gas di riserva.")
 
-
-    # ==========================================
+# ==========================================
     # 6. MODULO IDROGENO: L'ULTIMO MIGLIO (ZERO GAS)
     # ==========================================
     st.markdown("---")
@@ -640,8 +639,9 @@ try:
         curtailment_recuperato_nuc_twh = min(overgen_disp_twh * 0.1, taglia_elc_nuc_gw * 8760 * 0.1)
         energia_da_pagare_nuc_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_nuc_twh)
         
-        costo_energia_nuc_mln = energia_da_pagare_nuc_twh * 1e6 * mercato['cfd_nuc']
-        capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * 1e6 * capex_elc
+        # FIX ARITMETICO: GW * €/kW = Milioni di €. TWh * €/MWh = Milioni di €.
+        costo_energia_nuc_mln = energia_da_pagare_nuc_twh * mercato['cfd_nuc']
+        capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * capex_elc
         
         # OPZIONE B: RINNOVABILI DEDICATE (H2 Verde)
         cf_vre = 0.30
@@ -650,12 +650,14 @@ try:
         energia_da_pagare_vre_twh = max(0, energia_el_input_h2_twh - curtailment_recuperato_vre_twh)
         
         lcoe_vre_medio = (mercato['cfd_pv'] * 0.6) + (mercato['cfd_wind'] * 0.4) 
-        costo_energia_vre_mln = energia_da_pagare_vre_twh * 1e6 * lcoe_vre_medio
-        capex_tot_elc_vre_mln = taglia_elc_vre_gw * 1e6 * capex_elc
+        # FIX ARITMETICO
+        costo_energia_vre_mln = energia_da_pagare_vre_twh * lcoe_vre_medio
+        capex_tot_elc_vre_mln = taglia_elc_vre_gw * capex_elc
 
         # STEP 4: STOCCAGGIO E COMPRESSIONE 
         capacita_stoccaggio_kton = h2_necessario_kton * 0.30 
-        capex_stoccaggio_mln = capacita_stoccaggio_kton * 1e6 * capex_salt_cavern / 1e6
+        # FIX ARITMETICO: kton * €/kg = Milioni di €.
+        capex_stoccaggio_mln = capacita_stoccaggio_kton * capex_salt_cavern
         costo_compressione_mln = (h2_necessario_kton * 1e6) * lavoro_compressore_kwh_kg * (mercato['cfd_pv']/1000) / 1e6 
 
         # ANNUALIZZAZIONE COSTI (LCOH)
