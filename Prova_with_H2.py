@@ -64,11 +64,14 @@ def _serie_pesata(df, pesi_colonne, scala=1.0, clip_upper=1.0):
         serie = serie.clip(upper=clip_upper)
     return serie.astype(float)
 
+
 def _mappa_profilo_annuale_su_indice(profilo_orario, indice_target):
     profilo = profilo_orario.copy()
     profilo.index = pd.to_datetime(profilo.index)
+
     chiavi_sorgente = list(zip(profilo.index.month, profilo.index.day, profilo.index.hour))
     mappa = {chiave: valore for chiave, valore in zip(chiavi_sorgente, profilo.values)}
+
     valori = []
     for ts in indice_target:
         chiave = (ts.month, ts.day, ts.hour)
@@ -78,7 +81,9 @@ def _mappa_profilo_annuale_su_indice(profilo_orario, indice_target):
             valori.append(mappa.get((2, 28, ts.hour), mappa.get((3, 1, ts.hour), 0.0)))
         else:
             valori.append(0.0)
+
     return pd.Series(valori, index=indice_target, dtype=float)
+
 
 @st.cache_data
 def leggi_gme_radar(file_gme):
@@ -86,20 +91,25 @@ def leggi_gme_radar(file_gme):
         df_gme = pd.read_excel(file_gme, engine='openpyxl', header=None)
         miglior_serie = None
         max_somma = -1
+        
         for col in df_gme.columns:
             s = df_gme[col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
             s_num = pd.to_numeric(s, errors='coerce').dropna()
+            
             if len(s_num) >= 8760:
                 somma_corrente = s_num.sum()
                 if somma_corrente > max_somma:
                     max_somma = somma_corrente
                     ore_anno = 8784 if len(s_num) >= 8784 else 8760
                     miglior_serie = s_num.iloc[:ore_anno]
+        
         if miglior_serie is not None and max_somma > 0:
             idx = pd.date_range(start="2023-01-01 00:00", periods=len(miglior_serie), freq='h')
             return pd.DataFrame({'Fabbisogno_MW': miglior_serie.values}, index=idx), False
+            
     except Exception:
         pass
+    
     ore = 8760
     idx = pd.date_range(start="2023-01-01 00:00", periods=ore, freq='h')
     t = np.arange(ore)
@@ -108,16 +118,19 @@ def leggi_gme_radar(file_gme):
     fabbisogno_finto = np.clip(25000 + giorno_notte + stagione, a_min=15000, a_max=60000)
     return pd.DataFrame({'Fabbisogno_MW': fabbisogno_finto}, index=idx), True
 
+
 @st.cache_data
 def carica_profili_rinnovabili(file_fotovoltaico, file_eolico):
     df_pv = pd.read_csv(file_fotovoltaico)
     df_pv['time'] = pd.to_datetime(df_pv['time'], errors='coerce')
     df_pv = df_pv.dropna(subset=['time']).copy()
     df_pv.set_index('time', inplace=True)
+
     df_wind = pd.read_csv(file_eolico)
     df_wind['time'] = pd.to_datetime(df_wind['time'], errors='coerce')
     df_wind = df_wind.dropna(subset=['time']).copy()
     df_wind.set_index('time', inplace=True)
+
     profili = {
         'pv_nord': pd.Series(_serie_pesata(df_pv, PV_WEIGHTS_NORD, scala=1000.0, clip_upper=1.0).values, index=df_pv.index, name='pv_nord'),
         'pv_sud': pd.Series(_serie_pesata(df_pv, PV_WEIGHTS_SUD, scala=1000.0, clip_upper=1.0).values, index=df_pv.index, name='pv_sud'),
@@ -126,18 +139,24 @@ def carica_profili_rinnovabili(file_fotovoltaico, file_eolico):
     }
     return profili
 
+
 @st.cache_data
 def carica_dati_v2(file_fotovoltaico, file_gme, file_eolico, quota_pv_nord, quota_eolico_nord):
     df_gme, usato_fallback = leggi_gme_radar(file_gme)
     profili = carica_profili_rinnovabili(file_fotovoltaico, file_eolico)
+
     quota_pv_nord = float(quota_pv_nord)
     quota_eolico_nord = float(quota_eolico_nord)
+
     profilo_pv = (profili['pv_nord'] * quota_pv_nord) + (profili['pv_sud'] * (1.0 - quota_pv_nord))
     profilo_wind = (profili['wind_nord'] * quota_eolico_nord) + (profili['wind_sud'] * (1.0 - quota_eolico_nord))
+
     df_completo = df_gme.copy()
     df_completo['Fattore_Capacita_PV'] = _mappa_profilo_annuale_su_indice(profilo_pv, df_completo.index)
     df_completo['Fattore_Capacita_Wind'] = _mappa_profilo_annuale_su_indice(profilo_wind, df_completo.index)
+
     return df_completo.ffill(), usato_fallback
+
 
 # ==========================================
 # 2. SIMULAZIONE FISICA (Numba) - Rete
@@ -150,14 +169,17 @@ def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
     ore = len(fabbisogno)
     soc_corrente = bess_mwh * 0.5
     soc_hydro = hydro_bacino_max_mwh * 0.5
+
     prod_pv_array = produzione_pv * pv_mw
     prod_wind_array = produzione_wind * wind_mw
     potenza_nucleare_costante = nucleare_mw * 1
+
     gas_usato_totale = 0.0
     deficit_totale = 0.0
     overgen_totale = 0.0
     hydro_dispatched_totale = 0.0
     bess_scarica_totale = 0.0
+
     sqrt_eff = np.sqrt(efficienza_bess)
 
     for t in range(ore):
@@ -176,6 +198,7 @@ def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
             overgen_totale += (bilancio_netto - potenza_carica_effettiva)
         else:
             energia_richiesta = abs(bilancio_netto)
+
             potenza_scarica_bess = min(energia_richiesta, bess_mw)
             energia_out_bess = potenza_scarica_bess / sqrt_eff
             if soc_corrente >= energia_out_bess:
@@ -203,7 +226,9 @@ def simula_rete_light_fast(produzione_pv, produzione_wind, fabbisogno,
                 uso_gas = min(energia_richiesta, gas_mw)
                 gas_usato_totale += uso_gas
                 deficit_totale += (energia_richiesta - uso_gas)
+
     return gas_usato_totale, deficit_totale, overgen_totale, hydro_dispatched_totale, bess_scarica_totale
+
 
 # ==========================================
 # NUOVO MOTORE H2: CO-OTTIMIZZAZIONE ORARIA (Numba)
@@ -254,63 +279,65 @@ def estrai_curva_overgen_oraria(produzione_pv, produzione_wind, fabbisogno,
                     soc_hydro -= potenza_scarica_hydro
                 else:
                     soc_hydro = 0.0
+                    
     return overgen_array
 
 
 @njit
-def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW, target_mwh_el,
-                                capex_elc_kw, capex_batt_mwh, costo_annuo_vre_gw, crf):
-    miglior_costo = 1e15
+def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW_mw, target_mwh_el,
+                                capex_elc_kw, capex_batt_mwh, costo_annuo_vre_1gw_eur, crf):
+    miglior_costo = 1e18
     best_elc_gw = 0.0
     best_vre_gw = 0.0
     best_batt_gwh = 0.0
     best_recupero_mwh = 0.0
     
-    elc_base = target_mwh_el / 8760.0
-    ore_eq_vre = np.sum(vre_profile_1GW)
-    vre_base = target_mwh_el / ore_eq_vre if ore_eq_vre > 0 else 10.0
+    # TUTTE LE TAGLIE SONO ESPRESSE IN GW PER EVITARE BUG DI SCALA
+    elc_base_gw = (target_mwh_el / 8760.0) / 1000.0
+    ore_eq_vre = np.sum(vre_profile_1GW_mw) 
+    vre_base_gw = target_mwh_el / ore_eq_vre if ore_eq_vre > 0 else 10.0
     
-    elc_steps = np.linspace(elc_base * 0.5, elc_base * 6.0, 20)
-    vre_steps = np.linspace(0.0, vre_base * 2.0, 20)
-    batt_steps = np.linspace(0.0, vre_base * 4.0, 15)
+    elc_gw_steps = np.linspace(elc_base_gw * 0.5, elc_base_gw * 5.0, 20)
+    vre_gw_steps = np.linspace(0.0, vre_base_gw * 2.0, 20)
+    batt_gwh_steps = np.linspace(0.0, vre_base_gw * 2.0, 15)
     
     ore_tot = len(overgen_array)
     
-    for vre_gw in vre_steps:
-        costo_vre = vre_gw * costo_annuo_vre_gw
-        for elc_gw in elc_steps:
-            # FIX MATEMATICO: capex_elc_kw è €/kW. Moltiplichiamo per 1.000.000 per avere il costo di 1 GW.
-            costo_elc = elc_gw * 1000000.0 * capex_elc_kw * crf
-            for batt_gwh in batt_steps:
-                # capex_batt_mwh è €/MWh. Moltiplichiamo per 1000 per avere GWh.
-                costo_batt = batt_gwh * 1000.0 * capex_batt_mwh * crf
+    for vre_gw in vre_gw_steps:
+        costo_vre_eur = vre_gw * costo_annuo_vre_1gw_eur
+        for elc_gw in elc_gw_steps:
+            # GW * 1,000,000 = kW ---> kW * €/kW = Euro
+            costo_elc_eur = elc_gw * 1000000.0 * capex_elc_kw * crf 
+            for batt_gwh in batt_gwh_steps:
+                # GWh * 1,000 = MWh ---> MWh * €/MWh = Euro
+                costo_batt_eur = batt_gwh * 1000.0 * capex_batt_mwh * crf 
                 
-                costo_tot = costo_vre + costo_elc + costo_batt
-                if costo_tot >= miglior_costo:
+                costo_tot_eur = costo_vre_eur + costo_elc_eur + costo_batt_eur
+                if costo_tot_eur >= miglior_costo:
                     continue
                     
-                soc = 0.0
-                batt_mw = batt_gwh * 1000.0
+                soc_mwh = 0.0
+                batt_mw = batt_gwh * 1000.0 
                 elc_mw = elc_gw * 1000.0
                 eff = 0.95
-                energia_assorbita = 0.0
-                recupero_grid = 0.0
+                energia_assorbita_mwh = 0.0
+                recupero_grid_mwh = 0.0
                 
                 for t in range(ore_tot):
-                    p_vre = vre_profile_1GW[t] * vre_gw
+                    p_vre = vre_profile_1GW_mw[t] * vre_gw
                     p_grid = overgen_array[t]
                     
                     p_avail = p_vre + p_grid
-                    
                     p_discharge = 0.0
-                    if p_avail < elc_mw and soc > 0:
-                        p_discharge = min(soc * eff, batt_mw, elc_mw - p_avail)
+                    
+                    if p_avail < elc_mw and soc_mwh > 0:
+                        p_discharge = min(soc_mwh * eff, batt_mw, elc_mw - p_avail)
                         
                     p_tot = p_avail + p_discharge
                     
                     if p_tot >= elc_mw * 0.15:
                         p_elc = min(p_tot, elc_mw)
-                        energia_assorbita += p_elc
+                        energia_assorbita_mwh += p_elc
                         
                         if p_vre >= p_elc:
                             usato_grid = 0.0
@@ -323,28 +350,28 @@ def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW, target_mwh_el,
                                 usato_grid = p_grid
                                 p_excess = 0.0
                                 
-                        recupero_grid += usato_grid
-                        soc -= (p_discharge / eff)
+                        recupero_grid_mwh += usato_grid
+                        soc_mwh -= (p_discharge / eff)
                         
-                        if p_excess > 0 and soc < batt_gwh * 1000.0:
-                            charge = min(p_excess, batt_mw, (batt_gwh * 1000.0 - soc)/eff)
-                            soc += charge * eff
+                        if p_excess > 0 and soc_mwh < batt_gwh * 1000.0:
+                            charge = min(p_excess, batt_mw, (batt_gwh * 1000.0 - soc_mwh)/eff)
+                            soc_mwh += charge * eff
                     else:
-                        if p_avail > 0 and soc < batt_gwh * 1000.0:
-                            charge = min(p_avail, batt_mw, (batt_gwh * 1000.0 - soc)/eff)
-                            soc += charge * eff
+                        if p_avail > 0 and soc_mwh < batt_gwh * 1000.0:
+                            charge = min(p_avail, batt_mw, (batt_gwh * 1000.0 - soc_mwh)/eff)
+                            soc_mwh += charge * eff
                             
-                if energia_assorbita >= target_mwh_el:
-                    if costo_tot < miglior_costo:
-                        miglior_costo = costo_tot
+                if energia_assorbita_mwh >= target_mwh_el:
+                    if costo_tot_eur < miglior_costo:
+                        miglior_costo = costo_tot_eur
                         best_elc_gw = elc_gw
                         best_vre_gw = vre_gw
                         best_batt_gwh = batt_gwh
-                        best_recupero_mwh = recupero_grid
+                        best_recupero_mwh = recupero_grid_mwh
                         
     if best_elc_gw == 0.0:
-        best_elc_gw = elc_base * 3.5
-        best_vre_gw = vre_base * 1.5
+        best_elc_gw = elc_base_gw * 3.0
+        best_vre_gw = vre_base_gw * 1.5
         best_batt_gwh = 0.0
         best_recupero_mwh = 0.0
         
@@ -352,20 +379,19 @@ def co_ottimizza_h2_rinnovabile(overgen_array, vre_profile_1GW, target_mwh_el,
 
 @njit
 def ottimizza_h2_nucleare(overgen_array, target_mwh_el, capex_elc_kw, cfd_nuc, cf_nuc, crf):
-    miglior_costo = 1e15
+    miglior_costo = 1e18
     best_elc_gw = 0.0
     best_recupero_mwh = 0.0
     
-    elc_base = target_mwh_el / 8760.0
+    elc_base_gw = (target_mwh_el / 8760.0) / 1000.0
     ore_tot = len(overgen_array)
     
-    for elc_gw in np.linspace(elc_base * 0.5, elc_base * 5.0, 50):
-        # FIX MATEMATICO
-        costo_elc = elc_gw * 1000000.0 * capex_elc_kw * crf
+    for elc_gw in np.linspace(elc_base_gw * 0.5, elc_base_gw * 5.0, 50):
+        costo_elc_eur = elc_gw * 1000000.0 * capex_elc_kw * crf
         elc_mw = elc_gw * 1000.0
         
-        energia_assorbita = 0.0
-        recupero_grid = 0.0
+        energia_assorbita_mwh = 0.0
+        recupero_grid_mwh = 0.0
         p_nuc_piatto = elc_mw * cf_nuc
         
         for t in range(ore_tot):
@@ -373,24 +399,24 @@ def ottimizza_h2_nucleare(overgen_array, target_mwh_el, capex_elc_kw, cfd_nuc, c
             p_avail = p_nuc_piatto + p_grid
             
             p_elc = min(p_avail, elc_mw)
-            energia_assorbita += p_elc
+            energia_assorbita_mwh += p_elc
             
             if p_nuc_piatto >= p_elc:
                 usato_grid = 0.0
             else:
                 usato_grid = p_elc - p_nuc_piatto
                 
-            recupero_grid += usato_grid
+            recupero_grid_mwh += usato_grid
             
-        if energia_assorbita >= target_mwh_el:
-            costo_tot = costo_elc + ((energia_assorbita - recupero_grid) * cfd_nuc)
-            if costo_tot < miglior_costo:
-                miglior_costo = costo_tot
+        if energia_assorbita_mwh >= target_mwh_el:
+            costo_tot_eur = costo_elc_eur + ((energia_assorbita_mwh - recupero_grid_mwh) * cfd_nuc)
+            if costo_tot_eur < miglior_costo:
+                miglior_costo = costo_tot_eur
                 best_elc_gw = elc_gw
-                best_recupero_mwh = recupero_grid
+                best_recupero_mwh = recupero_grid_mwh
                 
     if best_elc_gw == 0.0:
-        best_elc_gw = elc_base / cf_nuc
+        best_elc_gw = elc_base_gw / cf_nuc
         best_recupero_mwh = 0.0
         
     return float(best_elc_gw), float(best_recupero_mwh)
@@ -693,7 +719,7 @@ try:
     # ==========================================
     st.markdown("---")
     st.header("🏭 L'Ultimo Miglio: Power-to-Gas con Co-Ottimizzazione di Rete")
-    st.markdown("Il motore Numba simula le combinazioni di impianti (Pannelli + Elettrolizzatori + Batterie) per 8760 ore, incrociandole con la curva di scarto della rete. Troverà la combinazione che **minimizza il costo totale (LCOH)** sfruttando l'energia gratuita estiva.")
+    st.markdown("Il motore Numba simula migliaia di combinazioni di impianti (Pannelli + Elettrolizzatori + Batterie) per 8760 ore, incrociandole con la curva di scarto della rete. Troverà la combinazione che **minimizza il costo totale (LCO_CH₄)**.")
 
     hc1, hc2, hc3, hc4 = st.columns(4)
     eff_meth = hc1.slider("Efficienza Metanazione (H₂ -> CH₄) [%]", 70.0, 90.0, 78.0, step=1.0) / 100
@@ -733,26 +759,26 @@ try:
             )
             energia_acquistata_nuc_mwh = h2_target_mwh_el - free_nuc_mwh
             costo_energia_nuc_mln = (energia_acquistata_nuc_mwh * mercato['cfd_nuc']) / 1e6
-            capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * capex_elc
+            capex_tot_elc_nuc_mln = taglia_elc_nuc_gw * capex_elc # taglia in GW * capex in €/kW dà il risultato in Milioni di Euro.
             curtailment_recuperato_nuc_twh = free_nuc_mwh / 1e6
 
 
             # === OPZIONE 2: VIA RINNOVABILE ===
             quota_pv = miglior_config['PV_GW'] / (miglior_config['PV_GW'] + miglior_config['Wind_GW'] + 1e-9)
-            vre_profile_1GW = (array_pv * quota_pv + array_wind * (1 - quota_pv)) * 1000.0 
+            vre_profile_1GW_mw = (array_pv * quota_pv + array_wind * (1 - quota_pv)) * 1000.0 
             
-            ore_eq_vre_1gw = np.sum(vre_profile_1GW)
+            ore_eq_vre_1gw = np.sum(vre_profile_1GW_mw)
             lcoe_vre_medio = (mercato['cfd_pv'] * quota_pv) + (mercato['cfd_wind'] * (1 - quota_pv))
-            costo_annuo_vre_gw = (ore_eq_vre_1gw * lcoe_vre_medio)
+            costo_annuo_vre_1gw_eur = (ore_eq_vre_1gw * lcoe_vre_medio)
             
             taglia_elc_vre_gw, taglia_vre_gw, taglia_batt_gwh, free_vre_mwh = co_ottimizza_h2_rinnovabile(
-                overgen_orario, vre_profile_1GW, h2_target_mwh_el,
-                capex_elc, mercato['bess_capex'], costo_annuo_vre_gw, crf
+                overgen_orario, vre_profile_1GW_mw, h2_target_mwh_el,
+                capex_elc, mercato['bess_capex'], costo_annuo_vre_1gw_eur, crf
             )
             
-            costo_energia_vre_mln = (taglia_vre_gw * costo_annuo_vre_gw) / 1e6
+            costo_energia_vre_mln = (taglia_vre_gw * costo_annuo_vre_1gw_eur) / 1e6
             capex_tot_elc_vre_mln = taglia_elc_vre_gw * capex_elc
-            capex_tot_batt_vre_mln = taglia_batt_gwh * 1000 * mercato['bess_capex'] * crf / 1e6
+            capex_tot_batt_vre_mln = taglia_batt_gwh * 1000.0 * mercato['bess_capex'] * crf / 1e6
             curtailment_recuperato_vre_twh = free_vre_mwh / 1e6
 
         # COSTI METANATORE E BUFFER CO2 
