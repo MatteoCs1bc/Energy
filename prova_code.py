@@ -86,42 +86,45 @@ def _mappa_profilo_annuale_su_indice(profilo_orario, indice_target):
 
 
 @st.cache_data
-def leggi_gme(file_gme):
-    df_gme = pd.read_excel(file_gme, engine='openpyxl')
-
-    # 1. Ricerca dinamica della colonna dei consumi
-    col_volumi = None
-    for col in df_gme.columns:
-        if str(col).lower() in ['fabbisogno', 'totale', 'volume', 'load', 'consumi', 'mwh']:
-            col_volumi = col
-            break
-    
-    # Fallback standard: prende la 3° colonna come nel GME originale
-    if col_volumi is None:
-        if len(df_gme.columns) >= 3:
-            col_volumi = df_gme.columns[2]
-        else:
-            col_volumi = df_gme.columns[-1]
-
-    # 2. Pulizia della formattazione europea (es. 1.000,50 -> 1000.50)
-    if df_gme[col_volumi].dtype == 'object':
-        df_gme[col_volumi] = df_gme[col_volumi].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-
-    # Trasforma tutto in numeri e cancella le celle testuali vuote/sporche
-    valori_numerici = pd.to_numeric(df_gme[col_volumi], errors='coerce').dropna()
-
-    if valori_numerici.empty or valori_numerici.sum() <= 0:
-        raise ValueError(f"Impossibile leggere i consumi dalla colonna '{col_volumi}'. Verifica il file GME.")
-
-    # 3. BYPASS ASSOLUTO DELLE DATE: Generiamo un calendario sintetico perfetto sulle N ore
-    ore_totali = len(valori_numerici)
-    if ore_totali == 8784:
-        idx = pd.date_range(start="2024-01-01 00:00", periods=ore_totali, freq='h') # Anno bisestile
-    else:
-        idx = pd.date_range(start="2023-01-01 00:00", periods=ore_totali, freq='h') # Anno standard
+def leggi_gme_radar(file_gme):
+    # La nuova funzione Radar Scanner (Ignora Cache Vecchia)
+    try:
+        df_gme = pd.read_excel(file_gme, engine='openpyxl', header=None)
         
-    df_pulito = pd.DataFrame({'Fabbisogno_MW': valori_numerici.values}, index=idx)
-    return df_pulito
+        miglior_serie = None
+        max_somma = -1
+        
+        # Scansiona tutte le colonne alla ricerca dei numeri
+        for col in df_gme.columns:
+            s = df_gme[col].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+            s_num = pd.to_numeric(s, errors='coerce').dropna()
+            
+            # Se la colonna ha almeno un anno di ore
+            if len(s_num) >= 8760:
+                somma_corrente = s_num.sum()
+                if somma_corrente > max_somma:
+                    max_somma = somma_corrente
+                    ore_anno = 8784 if len(s_num) >= 8784 else 8760
+                    miglior_serie = s_num.iloc[:ore_anno]
+        
+        if miglior_serie is not None and max_somma > 0:
+            idx = pd.date_range(start="2023-01-01 00:00", periods=len(miglior_serie), freq='h')
+            return pd.DataFrame({'Fabbisogno_MW': miglior_serie.values}, index=idx), False
+            
+    except Exception:
+        pass
+    
+    # FALLBACK ASSOLUTO: Crea un profilo Italiano Standard se il GME fallisce
+    ore = 8760
+    idx = pd.date_range(start="2023-01-01 00:00", periods=ore, freq='h')
+    t = np.arange(ore)
+    
+    # Base 25 GW + Ciclo Notte/Giorno 10 GW + Ciclo Stagionale 5 GW
+    giorno_notte = 10000 * np.sin(2 * np.pi * t / 24 - np.pi/2)
+    stagione = 5000 * np.sin(2 * np.pi * t / 8760 - np.pi/2)
+    fabbisogno_finto = np.clip(25000 + giorno_notte + stagione, a_min=15000, a_max=60000)
+    
+    return pd.DataFrame({'Fabbisogno_MW': fabbisogno_finto}, index=idx), True
 
 
 @st.cache_data
@@ -146,8 +149,8 @@ def carica_profili_rinnovabili(file_fotovoltaico, file_eolico):
 
 
 @st.cache_data
-def carica_dati(file_fotovoltaico, file_gme, file_eolico, quota_pv_nord, quota_eolico_nord):
-    df_gme = leggi_gme(file_gme)
+def carica_dati_v2(file_fotovoltaico, file_gme, file_eolico, quota_pv_nord, quota_eolico_nord):
+    df_gme, usato_fallback = leggi_gme_radar(file_gme)
     profili = carica_profili_rinnovabili(file_fotovoltaico, file_eolico)
 
     quota_pv_nord = float(quota_pv_nord)
@@ -160,7 +163,7 @@ def carica_dati(file_fotovoltaico, file_gme, file_eolico, quota_pv_nord, quota_e
     df_completo['Fattore_Capacita_PV'] = _mappa_profilo_annuale_su_indice(profilo_pv, df_completo.index)
     df_completo['Fattore_Capacita_Wind'] = _mappa_profilo_annuale_su_indice(profilo_wind, df_completo.index)
 
-    return df_completo.ffill()
+    return df_completo.ffill(), usato_fallback
 
 
 # ==========================================
@@ -276,9 +279,6 @@ def simula_tutti_scenari_fisici(array_pv, array_wind, array_fabbisogno):
 def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
     fabbisogno_tot_mwh = df_completo['Fabbisogno_MW'].sum()
     
-    if fabbisogno_tot_mwh <= 0:
-        raise ValueError("Il fabbisogno totale calcolato è 0. C'è un problema nella lettura del GME.")
-
     ore_eq_pv = df_completo['Fattore_Capacita_PV'].sum()
     ore_eq_wind = df_completo['Fattore_Capacita_Wind'].sum()
     hydro_fluente_tot_mwh = 2500.0 * len(df_completo)
@@ -387,8 +387,6 @@ def mostra_spiegazione():
     - **Nucleare:** 12 gCO₂/kWh
     - **Batterie:** 50 gCO₂/kWh (per energia erogata)
     - **Gas Naturale:** 550 gCO₂/kWh
-    *Si tratta di una Beta vibecodata, se vuoi darmi una mano a svilupparla scrivi a giovanni at unbelclima punto it*
-    *guarda il modello su: https://github.com/GioviCS1BC/simulatore_mix/ *
     """)
 
 col_vuota, col_bottone = st.columns([4, 1])
@@ -436,13 +434,16 @@ try:
     quota_fotovoltaico_nord = quota_fotovoltaico_nord_pct / 100.0
     quota_eolico_nord = quota_eolico_nord_pct / 100.0
 
-    df_completo = carica_dati(
+    df_completo, usato_fallback = carica_dati_v2(
         file_fotovoltaico,
         file_gme,
         file_eolico,
         quota_fotovoltaico_nord,
         quota_eolico_nord,
     )
+    
+    if usato_fallback:
+        st.warning("⚠️ Impossibile estrarre i consumi dal file GME fornito. È stato attivato il 'Carico di Emergenza' (Profilo Italiano Standard) per permetterti di utilizzare comunque la dashboard.")
 
     with st.spinner("Calcolo della rete elettrica... (Solo al primo avvio o quando cambia la geografia delle curve)"):
         risultati_fisici = simula_tutti_scenari_fisici(
@@ -520,7 +521,7 @@ try:
         bess_start = c3.number_input("Inizio BESS", 0, 40, 1)
         bess_end = c3.number_input("Fine BESS", 1, 40, 15)
         
-        nuc_start = c4.number_input("Inizio Nucleare", 0, 40, 12, help="Richiede molti anni di permitting e costruzione.")
+        nuc_start = c4.number_input("Inizio Nucleare", 0, 40, 12)
         nuc_end = c4.number_input("Fine Nucleare", 1, 50, 20)
 
     # Scudo Status Quo
