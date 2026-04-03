@@ -340,7 +340,8 @@ def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
             'Carbon_Intensity': carbon_intensity,
             'Gas_%': percentuale_gas,
             'LCOS_BESS': lcos,
-            'Overgen_TWh': r['overgen_mwh'] / 1e6
+            'Overgen_TWh': r['overgen_mwh'] / 1e6,
+            'gas_mwh': r['gas_mwh']  # <--- IL FIX E' QUI!
         })
 
     df_risultati = pd.DataFrame(storia)
@@ -362,67 +363,67 @@ def applica_economia_e_trova_ottimo(risultati_fisici, df_completo, mercato):
 # ==========================================
 # 4. INTERFACCIA UTENTE (STREAMLIT)
 # ==========================================
-st.title("⚡ Ottimizzatore Mix Energetico e Decarbonizzazione (BETA)")
-st.markdown("Scopri l'equilibrio tra Rinnovabili, Batterie e Nucleare valutando le emissioni dell'intero ciclo di vita.")
-
-@st.dialog("📖 Come funziona questo simulatore?")
-def mostra_spiegazione():
-    st.markdown("""
-    **Benvenuto nel Simulatore di Mix Energetico 1.0 di CS1BC!**
-    per smanettare coi parametri clicca le freccette in alto a sinistra e aggiorni il risultato della funzione obiettivo
-    Cos'è CS1BC? è un collettivo strafigo! unbelclima.it
-
-    ATTENZIONE!:
-    i dataset di produzione rinnovabile sono reali ora per ora e ora usano una **media geografica pesata NORD/SUD**.
-    Puoi regolare dalla sidebar la quota di NORD per il fotovoltaico e per l'eolico.
-
-    ### 🌿 Modello LCA (Life Cycle Assessment)
-    Le emissioni sono calcolate sull'intero ciclo di vita (dati IPCC):
-    - **Fotovoltaico:** 45 gCO₂/kWh
-    - **Eolico:** 11 gCO₂/kWh
-    - **Idroelettrico:** 24 gCO₂/kWh
-    - **Nucleare:** 12 gCO₂/kWh
-    - **Batterie:** 50 gCO₂/kWh (per energia erogata)
-    - **Gas Naturale:** 550 gCO₂/kWh
-    """)
-
-col_vuota, col_bottone = st.columns([4, 1])
-with col_bottone:
-    if st.button("ℹ️ Info / Istruzioni / Fonti"):
-        mostra_spiegazione()
-
-st.sidebar.header("🗺️ Mix geografico delle curve")
-quota_eolico_nord_pct = st.sidebar.slider(
-    "% eolico NORD", min_value=0.0, max_value=100.0, value=round(DEFAULT_WIND_NORD_SHARE * 100, 2), step=0.1,
-    help="La quota SUD è calcolata automaticamente come 100 - quota NORD."
-)
-quota_fotovoltaico_nord_pct = st.sidebar.slider(
-    "% fotovoltaico NORD", min_value=0.0, max_value=100.0, value=round(DEFAULT_PV_NORD_SHARE * 100, 2), step=0.1,
-    help="La quota SUD è calcolata automaticamente come 100 - quota NORD."
-)
-st.sidebar.caption(
-    f"Default realistici: FV NORD {DEFAULT_PV_NORD_SHARE * 100:.2f}% | FV SUD {(1 - DEFAULT_PV_NORD_SHARE) * 100:.2f}% | "
-    f"Eolico NORD {DEFAULT_WIND_NORD_SHARE * 100:.2f}% | Eolico SUD {(1 - DEFAULT_WIND_NORD_SHARE) * 100:.2f}%"
-)
-
-st.sidebar.header("⚙️ Parametri di Mercato")
-mercato = {
-    'cfd_pv': st.sidebar.slider("CfD Fotovoltaico (€/MWh)", 20.0, 150.0, 60.0, step=5.0),
-    'cfd_wind': st.sidebar.slider("CfD Eolico (€/MWh)", 30.0, 150.0, 80.0, step=5.0),
-    'cfd_nuc': st.sidebar.slider("CfD Nucleare (€/MWh)", 50.0, 200.0, 120.0, step=5.0),
-    'bess_capex': st.sidebar.slider("CAPEX Batterie (€/MWh installato)", 50000.0, 300000.0, 100000.0, step=10000.0),
-    'wacc_bess': st.sidebar.slider("WACC Batterie (%)", 0.0, 15.0, 5.0, step=0.5) / 100,
-    'bess_opex_fix': st.sidebar.slider("Manutenzione Annua BESS (% del CAPEX)", 0.0, 5.0, 1.5, step=0.1) / 100,
-    'bess_vita': 15,
-    'gas_eur_mwh': st.sidebar.slider("Prezzo Gas / Fossili (€/MWh)", 30.0, 300.0, 130.0, step=10.0),
-    'costo_base_integrazione': st.sidebar.slider(
-        "Costo Integrazione Rete (€/MWh)", 0.0, 20.0, 10.0,
-        help="Costo extra per bilanciamento e rete per gestire fotovoltaico ed eolico."
-    ),
-    'voll': 3000.0
-}
-
 try:
+    st.title("⚡ Ottimizzatore Mix Energetico e Decarbonizzazione (BETA)")
+    st.markdown("Scopri l'equilibrio tra Rinnovabili, Batterie e Nucleare valutando le emissioni dell'intero ciclo di vita.")
+
+    @st.dialog("📖 Come funziona questo simulatore?")
+    def mostra_spiegazione():
+        st.markdown("""
+        **Benvenuto nel Simulatore di Mix Energetico 1.0 di CS1BC!**
+        per smanettare coi parametri clicca le freccette in alto a sinistra e aggiorni il risultato della funzione obiettivo
+        Cos'è CS1BC? è un collettivo strafigo! unbelclima.it
+
+        ATTENZIONE!:
+        i dataset di produzione rinnovabile sono reali ora per ora e ora usano una **media geografica pesata NORD/SUD**.
+        Puoi regolare dalla sidebar la quota di NORD per il fotovoltaico e per l'eolico.
+
+        ### 🌿 Modello LCA (Life Cycle Assessment)
+        Le emissioni sono calcolate sull'intero ciclo di vita (dati IPCC):
+        - **Fotovoltaico:** 45 gCO₂/kWh
+        - **Eolico:** 11 gCO₂/kWh
+        - **Idroelettrico:** 24 gCO₂/kWh
+        - **Nucleare:** 12 gCO₂/kWh
+        - **Batterie:** 50 gCO₂/kWh (per energia erogata)
+        - **Gas Naturale:** 550 gCO₂/kWh
+        """)
+
+    col_vuota, col_bottone = st.columns([4, 1])
+    with col_bottone:
+        if st.button("ℹ️ Info / Istruzioni / Fonti"):
+            mostra_spiegazione()
+
+    st.sidebar.header("🗺️ Mix geografico delle curve")
+    quota_eolico_nord_pct = st.sidebar.slider(
+        "% eolico NORD", min_value=0.0, max_value=100.0, value=round(DEFAULT_WIND_NORD_SHARE * 100, 2), step=0.1,
+        help="La quota SUD è calcolata automaticamente come 100 - quota NORD."
+    )
+    quota_fotovoltaico_nord_pct = st.sidebar.slider(
+        "% fotovoltaico NORD", min_value=0.0, max_value=100.0, value=round(DEFAULT_PV_NORD_SHARE * 100, 2), step=0.1,
+        help="La quota SUD è calcolata automaticamente come 100 - quota NORD."
+    )
+    st.sidebar.caption(
+        f"Default realistici: FV NORD {DEFAULT_PV_NORD_SHARE * 100:.2f}% | FV SUD {(1 - DEFAULT_PV_NORD_SHARE) * 100:.2f}% | "
+        f"Eolico NORD {DEFAULT_WIND_NORD_SHARE * 100:.2f}% | Eolico SUD {(1 - DEFAULT_WIND_NORD_SHARE) * 100:.2f}%"
+    )
+
+    st.sidebar.header("⚙️ Parametri di Mercato")
+    mercato = {
+        'cfd_pv': st.sidebar.slider("CfD Fotovoltaico (€/MWh)", 20.0, 150.0, 60.0, step=5.0),
+        'cfd_wind': st.sidebar.slider("CfD Eolico (€/MWh)", 30.0, 150.0, 80.0, step=5.0),
+        'cfd_nuc': st.sidebar.slider("CfD Nucleare (€/MWh)", 50.0, 200.0, 120.0, step=5.0),
+        'bess_capex': st.sidebar.slider("CAPEX Batterie (€/MWh installato)", 50000.0, 300000.0, 100000.0, step=10000.0),
+        'wacc_bess': st.sidebar.slider("WACC Batterie (%)", 0.0, 15.0, 5.0, step=0.5) / 100,
+        'bess_opex_fix': st.sidebar.slider("Manutenzione Annua BESS (% del CAPEX)", 0.0, 5.0, 1.5, step=0.1) / 100,
+        'bess_vita': 15,
+        'gas_eur_mwh': st.sidebar.slider("Prezzo Gas / Fossili (€/MWh)", 30.0, 300.0, 130.0, step=10.0),
+        'costo_base_integrazione': st.sidebar.slider(
+            "Costo Integrazione Rete (€/MWh)", 0.0, 20.0, 10.0,
+            help="Costo extra per bilanciamento e rete per gestire fotovoltaico ed eolico."
+        ),
+        'voll': 3000.0
+    }
+
     cartella_script = os.path.dirname(os.path.abspath(__file__))
     file_fotovoltaico = os.path.join(cartella_script, "dataset_fotovoltaico_produzione.csv")
     file_gme = os.path.join(cartella_script, "gme.xlsx")
@@ -705,10 +706,10 @@ try:
 # GESTIONE ERRORI
 # ==========================================
 except FileNotFoundError:
-    st.error("⚠️ File dati non trovati! Assicurati che i file `dataset_fotovoltaico_produzione.csv`, `gme.xlsx` e `dataset_eolico_produzione.csv` siano nella stessa cartella dell'app.")
+    st.error("⚠️ File dati non trovati! Assicurati che i dataset siano nella stessa cartella dell'app.")
 except ValueError as e:
     st.error(f"⚠️ Dati anomali o formattazione errata: {e}")
 except KeyError as e:
-    st.error(f"⚠️ Struttura dei dataset non compatibile con i pesi geografici configurati: {e}")
+    st.error(f"⚠️ Errore di lettura campi. Se l'errore è 'gas_mwh', ricarica la pagina. Errore originale: {e}")
 except Exception as e:
     st.error(f"⚠️ Errore imprevisto durante l'elaborazione dei dati: {e}")
